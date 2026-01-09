@@ -1,6 +1,4 @@
-langid
 peft
-punctuators
 soundfile
 streamlit
 torch
