@@ -2,7 +2,4 @@
 .ipynb_checkpoints
 *.ipynb
 streamlit_env
-granite_speech_transformers.py
-granite_speech_transformers_2.py
-gradio_app.py
-streamlit_app_v1.py
+
