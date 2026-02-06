@@ -1,5 +1,6 @@
-peft
-soundfile
+pytest
+pyright
+ruff
 streamlit
 torch
 torchaudio
