@@ -94,6 +94,15 @@ MAX_VAD_OFF_DURATION_S = 120
 # 8s is the widest cap that still translated everything, so it fragments the
 # audio (and multiplies inference count) as little as possible.
 MAX_SEGMENT_DURATION_S = 8.0
+# Floor for splitting an over-long span. From the same measurements: 5s -> 12/12
+# but 4s -> 12/16, because short parts land mid-utterance. A span only slightly
+# over the cap must not be halved into sub-floor slivers — the overshoot costs
+# less accuracy than the split would.
+MIN_SEGMENT_DURATION_S = 5.0
+# Where a single inference stops translating and echoes the source verbatim.
+# Only reachable with VAD off, since the cap above keeps every VAD segment well
+# under it.
+TRANSLATION_PASSTHROUGH_S = 20.0
 TOXICITY_THRESHOLD = 0.5
 TOXICITY_SCORE_PRECISION = 4
 
@@ -192,6 +201,13 @@ def _split_long_segment(
     if duration <= max_duration:
         return [{"start": start, "end": end}]
     parts = math.ceil(duration / max_duration)
+    # Back off the part count rather than emit parts below the accuracy floor:
+    # buffering pushes a natural 8.0s span to 8.6s, which would otherwise halve
+    # into 2 x 4.3s. The floor cannot exceed the cap itself, or a caller passing
+    # a small max_duration would stop getting any split at all.
+    floor = min(MIN_SEGMENT_DURATION_S, max_duration)
+    while parts > 1 and duration / parts < floor:
+        parts -= 1
     step = duration / parts
     return [
         {"start": start + i * step, "end": start + (i + 1) * step} for i in range(parts)
@@ -225,6 +241,16 @@ def get_speech_segments(
         ):
             segments[-1]["end"] = max(segments[-1]["end"], buffered_end)
         else:
+            # The buffers can pull this span's start behind the previous
+            # segment's end. Merging used to absorb that overlap unconditionally
+            # (a negative gap always satisfies the min_gap test), so the cap is
+            # what first made this reachable: clamp instead, or the same audio
+            # gets transcribed twice and timestamps run backwards.
+            if segments:
+                buffered_start = max(buffered_start, segments[-1]["end"])
+                if buffered_start >= buffered_end:
+                    # Wholly covered by the previous segment already.
+                    continue
             segments.append({"start": buffered_start, "end": buffered_end})
     # A single VAD span can exceed the cap on its own (unbroken speech, or the
     # no-gap fallback above), so split whatever is still over.
@@ -233,6 +259,14 @@ def get_speech_segments(
         for seg in segments
         for part in _split_long_segment(seg["start"], seg["end"], max_segment_duration)
     ]
+
+
+def _verdict(probability: float) -> tuple[bool, float]:
+    """Shared toxic/score verdict so the two callers cannot drift apart."""
+    return (
+        probability > TOXICITY_THRESHOLD,
+        round(probability, TOXICITY_SCORE_PRECISION),
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -305,10 +339,7 @@ def check_safety(
         logits = model(**inputs).logits
         probability = torch.softmax(logits, dim=1)[0, 1].item()
         max_probability = max(max_probability, probability)
-    return (
-        max_probability > TOXICITY_THRESHOLD,
-        round(max_probability, TOXICITY_SCORE_PRECISION),
-    )
+    return _verdict(max_probability)
 
 
 def transcribe_audio(
@@ -394,10 +425,7 @@ def _aggregate_segment_safety(
             continue
         _, probability = check_safety(text, model, tokenizer)
         max_probability = max(max_probability, probability)
-    return (
-        max_probability > TOXICITY_THRESHOLD,
-        round(max_probability, TOXICITY_SCORE_PRECISION),
-    )
+    return _verdict(max_probability)
 
 
 @torch.inference_mode()
@@ -615,6 +643,19 @@ def main() -> None:
                 "falls back to untranslated source text on long audio.",
                 icon=":material/warning:",
             )
+        elif any(task != "Transcribe" for task in selected_tasks) and (
+            duration is None or duration > TRANSLATION_PASSTHROUGH_S
+        ):
+            # Short clips still translate fine with VAD off, so warn rather
+            # than disable — but past the passthrough point the result card
+            # looks finished while holding untranslated source text.
+            st.warning(
+                "Enable VAD segmentation to translate this clip: with it off "
+                "the whole clip is one inference, and past "
+                f"~{TRANSLATION_PASSTHROUGH_S:.0f}s the model returns "
+                "untranslated source text instead of reporting an error.",
+                icon=":material/warning:",
+            )
 
     st.markdown(
         "**Keywords**",
@@ -636,9 +677,10 @@ def main() -> None:
     use_toxicity_check = _labeled_toggle(
         "Toxicity check",
         help=(
-            "Checks English transcripts and translations for toxic content "
-            "via Granite Guardian. Non-English output is skipped regardless "
-            "of this setting."
+            "Checks output that may be English for toxic content via Granite "
+            "Guardian. English audio can come back untranslated, so every task "
+            "is checked when the source is English; non-English sources are "
+            "checked only for translations into English."
         ),
         key="use_toxicity_check",
     )
@@ -714,7 +756,6 @@ def main() -> None:
                 use_segmentation=use_segmentation,
                 keywords=keywords,
             )
-            progress.empty()
             st.session_state.results = pipeline_results
             if uploaded:
                 stem = Path(audio_file.name).stem
@@ -731,6 +772,10 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - top-level UI error boundary
             st.exception(e)
             return
+        finally:
+            # Also on the error paths, or a half-filled bar labelled with the
+            # task that failed stays on screen next to the error message.
+            progress.empty()
         st.toast("Pipeline complete!")
 
     if "results" in st.session_state:

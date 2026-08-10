@@ -73,7 +73,7 @@ uv run streamlit run streamlit_app.py
 
 - **Apple Silicon only** — inference uses MLX; there's no CUDA or CPU-only fallback.
 - **Translation pivots through English** — English ↔ X only; no direct X → Y (e.g. French → German).
-- **Toxicity detection is English-only** (Granite Guardian HAP).
+- **Toxicity detection is English-only** (Granite Guardian HAP). Because English audio can come back untranslated, every task is checked when the source is English; non-English sources are checked only for translations into English.
 - **Upload limit 500 MB**; with VAD off, clips are capped at 2 minutes — a single inference that long already peaks around 14 GB of memory.
 - **Translation needs VAD on.** Past roughly 20 seconds in one pass the model stops translating and echoes the source language back verbatim, with no error. VAD segmentation keeps every chunk under 8s, which is why it defaults to on.
 

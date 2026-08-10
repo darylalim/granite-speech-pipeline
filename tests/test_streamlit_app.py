@@ -13,6 +13,7 @@ from streamlit_app import (
     GUARDIAN_MODEL_ID,
     MAX_SEGMENT_DURATION_S,
     MAX_VAD_OFF_DURATION_S,
+    MIN_SEGMENT_DURATION_S,
     MODEL_ID,
     MODEL_REVISION,
     SOURCE_LANGUAGES,
@@ -23,6 +24,7 @@ from streamlit_app import (
     _aggregate_segment_safety,
     _render_result_card,
     _row_sizes,
+    _split_long_segment,
     _supports_encoder_hoist,
     apply_keywords,
     audio_duration_seconds,
@@ -149,7 +151,7 @@ def test_supported_formats() -> None:
     assert VIDEO_FORMATS.issubset(set(SUPPORTED_FORMATS))
 
 
-def test_max_vad_off_duration_is_five_minutes() -> None:
+def test_max_vad_off_duration_is_two_minutes() -> None:
     assert MAX_VAD_OFF_DURATION_S == 120
 
 
@@ -461,10 +463,53 @@ class TestGetSpeechSegments:
         )
         assert result == [{"start": pytest.approx(0.7), "end": pytest.approx(2.3)}]
 
+    def test_segments_never_overlap_when_the_cap_blocks_a_merge(self) -> None:
+        # Buffering pulls each span's start 0.3s back and pushes its end 0.3s
+        # on, so consecutive spans overlap by 0.5s. Merging used to absorb that
+        # unconditionally; once the cap can refuse the merge, the overlap has to
+        # be clamped or the same audio is transcribed twice and the rendered
+        # timestamps run backwards.
+        vad = [(float(i), i + 0.9) for i in range(60)]
+        result = self._run(torch.zeros(1, 16000 * 60), vad, max_segment_duration=8.0)
+        assert len(result) > 1
+        for earlier, later in pairwise(result):
+            assert later["start"] >= earlier["end"] - 1e-6
+
+    def test_segments_are_monotonic_across_cap_values(self) -> None:
+        vad = [(float(i), i + 0.9) for i in range(40)]
+        for cap in (5.0, 8.0, 10.0, 15.0):
+            result = self._run(
+                torch.zeros(1, 16000 * 40), vad, max_segment_duration=cap
+            )
+            for earlier, later in pairwise(result):
+                assert later["start"] >= earlier["end"] - 1e-6, f"overlap at cap={cap}"
+            assert all(seg["end"] > seg["start"] for seg in result)
+
+    def test_span_just_over_the_cap_is_not_split_below_the_floor(self) -> None:
+        # 8.3s at an 8.0s cap would halve into 2 x 4.15s, landing in the bucket
+        # the measurements call out as worse (4s -> 12/16) than the overshoot.
+        parts = _split_long_segment(0.0, 8.3, 8.0)
+        assert len(parts) == 1
+        assert parts[0] == {"start": 0.0, "end": 8.3}
+
+    def test_long_spans_still_split_above_the_floor(self) -> None:
+        parts = _split_long_segment(0.0, 24.0, 8.0)
+        assert len(parts) == 3
+        assert all(
+            p["end"] - p["start"] >= MIN_SEGMENT_DURATION_S - 1e-6 for p in parts
+        )
+
+    def test_floor_never_defeats_a_cap_smaller_than_it(self) -> None:
+        # A caller passing max_duration below the floor must still get a split.
+        parts = _split_long_segment(0.0, 12.0, 4.0)
+        assert len(parts) == 3
+        assert all(p["end"] - p["start"] <= 4.0 + 1e-6 for p in parts)
+
     def test_default_cap_is_below_the_measured_translation_cliff(self) -> None:
-        # 20s+ segments collapse to source-language passthrough; the default
-        # must stay under that with margin.
-        assert 0 < MAX_SEGMENT_DURATION_S <= 15.0
+        # 8s is the widest cap measured to translate every segment (10s already
+        # drops to 2/4), so anchor on the measurement rather than on the ~20s
+        # cliff — a loose bound here would go green at a known-broken cap.
+        assert 0 < MAX_SEGMENT_DURATION_S <= 8.0
 
 
 # ---------------------------------------------------------------------------
