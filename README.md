@@ -34,10 +34,10 @@ Three models run as a pipeline, loaded on first run and cached thereafter:
 | Model | Role | Runs on |
 |-------|------|---------|
 | [Granite Speech 4.1 2B (8-bit, MLX)](https://huggingface.co/divydeep/granite-speech-4.1-2b-mlx-8bit) | Transcription and translation | Apple GPU (MLX) |
-| [Silero VAD](https://github.com/snakers4/silero-vad) | Splits audio into speech segments | CPU |
+| [Silero VAD v6](https://huggingface.co/mlx-community/silero-vad-v6) | Splits audio into speech segments | Apple GPU (MLX) |
 | [Granite Guardian HAP 125m](https://huggingface.co/ibm-granite/granite-guardian-hap-125m) | English toxicity detection | CPU |
 
-Audio is loaded and resampled to 16 kHz mono, optionally segmented with VAD, then transcribed and translated segment-by-segment on the GPU. Each segment is encoded once and reused across every selected task, so N tasks cost one audio encode rather than N. Any output that may be English is scored for toxicity.
+Audio is loaded and resampled to 16 kHz mono, optionally segmented with VAD, then transcribed and translated segment-by-segment on the GPU. VAD runs on the GPU too, batching its encoder across chunks so a whole clip costs a couple of model calls rather than one per 32 ms; it falls back to the PyTorch build of the same checkpoint, on CPU, if the MLX weights are unavailable. Each segment is encoded once and reused across every selected task, so N tasks cost one audio encode rather than N. Any output that may be English is scored for toxicity.
 
 ## Requirements
 
@@ -96,7 +96,7 @@ uv run pytest           # run tests
 ## Acknowledgements
 
 - [IBM Granite](https://huggingface.co/ibm-granite) — Speech and Guardian models
-- [Silero VAD](https://github.com/snakers4/silero-vad) — voice activity detection
+- [Silero VAD](https://github.com/snakers4/silero-vad) — voice activity detection ([MLX port](https://huggingface.co/mlx-community/silero-vad-v6))
 - [Apple MLX](https://github.com/ml-explore/mlx) and [mlx-audio](https://github.com/Blaizzy/mlx-audio) — on-device inference
 - [Streamlit](https://streamlit.io/) — web UI
 

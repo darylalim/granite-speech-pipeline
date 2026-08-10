@@ -1,7 +1,7 @@
 from collections.abc import Iterator
 from itertools import pairwise
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx  # ty: ignore[unresolved-import]
@@ -11,25 +11,35 @@ import torch
 
 from streamlit_app import (
     _HOIST_ATTRS,
+    _MLX_VAD_BRANCH_ATTRS,
+    _MLX_VAD_BRANCH_CONFIG_ATTRS,
+    _MLX_VAD_CONFIG_ATTRS,
     EN_TARGETS,
     GUARDIAN_MODEL_ID,
     MAX_SEGMENT_DURATION_S,
     MAX_VAD_OFF_DURATION_S,
     MIN_SEGMENT_DURATION_S,
+    MLX_VAD_REPO,
+    MLX_VAD_REVISION,
     MODEL_ID,
     MODEL_REVISION,
     SOURCE_LANGUAGES,
     SUPPORTED_FORMATS,
     TRANSCRIBE_PROMPT,
+    VAD_CHUNK_SAMPLES,
+    VAD_CONTEXT_SAMPLES,
     VIDEO_FORMATS,
     PipelineResult,
     _aggregate_segment_safety,
     _encode_segment,
     _generate_from_features,
+    _mlx_vad_probabilities,
+    _mlx_vad_windows,
     _render_result_card,
     _row_sizes,
     _split_long_segment,
     _supports_encoder_hoist,
+    _supports_mlx_vad,
     apply_keywords,
     audio_duration_seconds,
     build_tasks,
@@ -157,6 +167,14 @@ def test_supported_formats() -> None:
 
 def test_max_vad_off_duration_is_two_minutes() -> None:
     assert MAX_VAD_OFF_DURATION_S == 120
+
+
+def test_mlx_vad_revision_is_pinned() -> None:
+    # mlx_audio's VAD loader cannot use strict=True (the v6 conversion ships no
+    # vad_8k keys), so renamed weight keys would load as random layers and pass
+    # every other guard. A content hash is what rules that out.
+    assert MLX_VAD_REPO == "mlx-community/silero-vad-v6"
+    assert MLX_VAD_REVISION == "2ebf4a5e10726a2e78ddd4d70eedfb6f1c33eb06"
 
 
 # ---------------------------------------------------------------------------
@@ -352,28 +370,283 @@ def test_row_sizes(n: int, expected: list[int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MLX_VAD_MODEL_ATTRS = ("vad_16k", "config", "dtype", "_probs_to_timestamps")
+
+
+def make_mlx_vad_model(drop: str | None = None) -> MagicMock:
+    """A model shaped like mlx_audio's, optionally missing one probed name.
+
+    spec= throughout so hasattr answers honestly — a bare MagicMock would
+    conjure every attribute the probe asks for and never report drift.
+    """
+    model_attrs = [a for a in _MLX_VAD_MODEL_ATTRS if a != drop]
+    model = MagicMock(spec=model_attrs)
+    if "dtype" in model_attrs:
+        model.dtype = mx.float32
+    if "vad_16k" in model_attrs:
+        branch_attrs = [a for a in _MLX_VAD_BRANCH_ATTRS if a != drop]
+        model.vad_16k = MagicMock(spec=[*branch_attrs, "config"])
+        branch_config_attrs = [a for a in _MLX_VAD_BRANCH_CONFIG_ATTRS if a != drop]
+        model.vad_16k.config = MagicMock(spec=branch_config_attrs)
+        # The probe checks these two by value, not just by name.
+        if "chunk_size" in branch_config_attrs:
+            model.vad_16k.config.chunk_size = VAD_CHUNK_SAMPLES
+        if "context_size" in branch_config_attrs:
+            model.vad_16k.config.context_size = VAD_CONTEXT_SAMPLES
+    if "config" in model_attrs:
+        model.config = MagicMock(spec=[a for a in _MLX_VAD_CONFIG_ATTRS if a != drop])
+    return model
+
+
 class TestSileroVad:
+    """The PyTorch path, which is now the fallback rather than the default."""
+
     def test_returns_tuples_in_seconds(self) -> None:
         mock_timestamps = [
             {"start": 16000, "end": 48000},
             {"start": 64000, "end": 96000},
         ]
         with patch("streamlit_app.get_speech_timestamps", return_value=mock_timestamps):
-            result = silero_vad(torch.zeros(1, 160000), MagicMock())
+            result = silero_vad(torch.zeros(1, 160000), MagicMock(spec=torch.nn.Module))
         assert result == [(1.0, 3.0), (4.0, 6.0)]
 
     def test_empty_audio_returns_empty_list(self) -> None:
         with patch("streamlit_app.get_speech_timestamps", return_value=[]):
-            assert silero_vad(torch.zeros(1, 16000), MagicMock()) == []
+            assert (
+                silero_vad(torch.zeros(1, 16000), MagicMock(spec=torch.nn.Module)) == []
+            )
 
     def test_passes_model_and_sample_rate(self) -> None:
-        model = MagicMock()
+        model = MagicMock(spec=torch.nn.Module)
         wav = torch.zeros(1, 16000)
         with patch("streamlit_app.get_speech_timestamps", return_value=[]) as mock_fn:
             silero_vad(wav, model)
         assert torch.equal(mock_fn.call_args[0][0], wav.squeeze())
         assert mock_fn.call_args[0][1] is model
         assert mock_fn.call_args[1]["sampling_rate"] == 16000
+
+
+class TestSupportsMlxVad:
+    def test_accepts_a_complete_model(self) -> None:
+        assert _supports_mlx_vad(make_mlx_vad_model())
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            *_MLX_VAD_MODEL_ATTRS,
+            *_MLX_VAD_BRANCH_ATTRS,
+            *_MLX_VAD_BRANCH_CONFIG_ATTRS,
+            *_MLX_VAD_CONFIG_ATTRS,
+        ],
+    )
+    def test_rejects_a_model_missing_any_probed_name(self, missing: str) -> None:
+        assert not _supports_mlx_vad(make_mlx_vad_model(drop=missing))
+
+    def test_rejects_an_unrelated_object(self) -> None:
+        assert not _supports_mlx_vad(object())
+
+    @pytest.mark.parametrize("field", ["chunk_size", "context_size"])
+    def test_rejects_framing_this_path_cannot_serve(self, field: str) -> None:
+        # The pin freezes the repo's config.json but not mlx_audio's
+        # BranchConfig defaults, which fill in omitted fields — so a dependency
+        # upgrade can still move the framing. Neither this path nor
+        # _probs_to_timestamps (which hardcodes a 512-sample stride) could
+        # serve it, so the probe must refuse rather than frame it wrong.
+        model = make_mlx_vad_model()
+        setattr(model.vad_16k.config, field, 256)
+        assert not _supports_mlx_vad(model)
+
+
+class TestSileroVadDispatch:
+    def test_torch_model_takes_the_torch_path(self) -> None:
+        with patch("streamlit_app.get_speech_timestamps", return_value=[]) as mock_fn:
+            silero_vad(torch.zeros(1, 16000), MagicMock(spec=torch.nn.Module))
+        mock_fn.assert_called_once()
+
+    def test_mlx_model_takes_the_batched_path(self) -> None:
+        model = make_mlx_vad_model()
+        model._probs_to_timestamps.return_value = [{"start": 16000, "end": 48000}]
+        with patch(
+            "streamlit_app._mlx_vad_probabilities", return_value=mx.zeros((4,))
+        ) as mock_probs:
+            result = silero_vad(torch.zeros(1, 160000), model)
+        mock_probs.assert_called_once()
+        assert result == [(1.0, 3.0)]
+        assert model._probs_to_timestamps.call_args[1]["audio_len"] == 160000
+
+    def test_threshold_config_reaches_the_timestamp_scan(self) -> None:
+        # The four values the probe checks for must be the four actually used.
+        # Hardcode any of them and the PyTorch fallback keeps its own defaults,
+        # so a repo shipping a non-default threshold makes the backends disagree.
+        model = make_mlx_vad_model()
+        model._probs_to_timestamps.return_value = []
+        sentinels = {
+            "threshold": 0.37,
+            "min_speech_duration_ms": 111,
+            "min_silence_duration_ms": 222,
+            "speech_pad_ms": 33,
+        }
+        for name, value in sentinels.items():
+            setattr(model.config, name, value)
+        with patch("streamlit_app._mlx_vad_probabilities", return_value=mx.zeros((4,))):
+            silero_vad(torch.zeros(1, 16000), model)
+        kwargs = model._probs_to_timestamps.call_args[1]
+        assert {name: kwargs[name] for name in sentinels} == sentinels
+
+    def test_non_16k_audio_never_reaches_the_mlx_model(self) -> None:
+        # The v6 conversion ships no trained 8 kHz weights, but mlx_audio builds
+        # that branch anyway and loads non-strictly, so an 8 kHz call would run
+        # randomly initialised layers and return confident nonsense.
+        model = make_mlx_vad_model()
+        with (
+            patch("streamlit_app._torch_vad_model") as mock_load,
+            patch("streamlit_app.get_speech_timestamps", return_value=[]) as mock_fn,
+            patch("streamlit_app._mlx_vad_probabilities") as mock_probs,
+        ):
+            silero_vad(torch.zeros(1, 8000), model, sample_rate=8000)
+        mock_probs.assert_not_called()
+        assert mock_fn.call_args[0][1] is mock_load.return_value
+
+    def test_mlx_failure_warns_and_falls_back_to_torch(self) -> None:
+        # hasattr only catches renames; a changed signature lands here instead.
+        model = make_mlx_vad_model()
+        with (
+            patch(
+                "streamlit_app._mlx_vad_probabilities",
+                side_effect=TypeError("unexpected keyword"),
+            ),
+            patch("streamlit_app._torch_vad_model") as mock_load,
+            patch(
+                "streamlit_app.get_speech_timestamps",
+                return_value=[{"start": 0, "end": 16000}],
+            ) as mock_fn,
+            pytest.warns(RuntimeWarning, match="MLX VAD failed"),
+        ):
+            result = silero_vad(torch.zeros(1, 16000), model)
+        assert result == [(0.0, 1.0)]
+        assert mock_fn.call_args[0][1] is mock_load.return_value
+
+
+class TestMlxVadInternals:
+    """Executes the real _mlx_vad_windows / _mlx_vad_probabilities bodies.
+
+    Every other VAD test mocks them out, so without this class the code driving
+    mlx_audio's branch submodules never runs in CI and an upstream change ships
+    green. _supports_mlx_vad cannot help: it only checks that names exist.
+
+    The model here is a genuine mlx_audio Model built from a real ModelConfig
+    with random weights — no download, but real classes, real shapes, and a real
+    streaming implementation to check the batched one against.
+    """
+
+    @staticmethod
+    def _real_model() -> Any:
+        module = pytest.importorskip("mlx_audio.vad.models.silero_vad.silero_vad")
+        config = pytest.importorskip("mlx_audio.vad.models.silero_vad.config")
+        return module.Model(config.ModelConfig())
+
+    def test_windows_frame_audio_like_the_streaming_loop(self) -> None:
+        audio = mx.arange(1000, dtype=mx.float32)
+        windows = _mlx_vad_windows(audio)
+        # 1000 samples pad up to 1024 = 2 chunks, each carrying 64 of context.
+        assert windows.shape == (2, VAD_CONTEXT_SAMPLES + VAD_CHUNK_SAMPLES)
+        assert mx.all(windows[0, :VAD_CONTEXT_SAMPLES] == 0).item()
+        assert mx.array_equal(windows[0, VAD_CONTEXT_SAMPLES:], mx.arange(512)).item()
+        # The second window's context is the first chunk's tail, not zeros.
+        assert mx.array_equal(
+            windows[1, :VAD_CONTEXT_SAMPLES], mx.arange(448, 512)
+        ).item()
+
+    def test_windows_are_empty_for_empty_audio(self) -> None:
+        assert _mlx_vad_windows(mx.zeros((0,))).shape[0] == 0
+
+    def test_batched_probabilities_match_the_streaming_reference(self) -> None:
+        # The whole premise: batching the encoder and running one LSTM pass must
+        # reproduce mlx_audio's chunk-at-a-time loop, not merely approximate it.
+        model = self._real_model()
+        audio = mx.array(
+            np.random.default_rng(0).standard_normal(16000).astype(np.float32)
+        )
+        mine = _mlx_vad_probabilities(model, audio)
+        reference = model._predict_proba_array(audio, 16000).reshape(-1)
+        mx.eval(mine, reference)
+        assert mine.shape == reference.shape
+        assert float(mx.max(mx.abs(mine - reference)).item()) < 1e-5
+
+    def test_lstm_state_carries_across_encoder_batches(self) -> None:
+        # With a batch size below the chunk count the (hidden, cell) handoff is
+        # what keeps the recurrence intact; drop it and probabilities restart
+        # mid-audio. A single batch would never exercise it.
+        model = self._real_model()
+        audio = mx.array(
+            np.random.default_rng(1).standard_normal(16000).astype(np.float32)
+        )
+        reference = model._predict_proba_array(audio, 16000).reshape(-1)
+        with patch("streamlit_app.VAD_ENCODER_BATCH_CHUNKS", 4):
+            batched = _mlx_vad_probabilities(model, audio)
+        mx.eval(batched, reference)
+        assert batched.shape == reference.shape
+        assert float(mx.max(mx.abs(batched - reference)).item()) < 1e-5
+
+    def test_real_mlx_audio_vad_model_still_exposes_the_internals(self) -> None:
+        # Guards the actual installed mlx_audio, which make_mlx_vad_model cannot.
+        assert _supports_mlx_vad(self._real_model())
+
+    def test_refuses_framing_that_leaves_more_than_one_frame_per_chunk(self) -> None:
+        """The batched path reuses the batch axis as the LSTM's sequence axis.
+
+        That only holds while the conv stack collapses each window to one frame.
+        Measured: hop_length=64 leaves 2, and taking frame 0 would silently drop
+        half of them while the reference averages. This must raise so the
+        try/except in silero_vad falls back rather than emit plausible garbage.
+        """
+        module = pytest.importorskip("mlx_audio.vad.models.silero_vad.silero_vad")
+        config = pytest.importorskip("mlx_audio.vad.models.silero_vad.config")
+        model = module.Model(
+            config.ModelConfig(branch_16k=config.BranchConfig(hop_length=64))
+        )
+        with pytest.raises(ValueError, match="frames per chunk"):
+            _mlx_vad_probabilities(model, mx.zeros((16000,)))
+
+    def test_audio_is_cast_to_the_model_dtype(self) -> None:
+        # Model.__call__ casts every input; this path bypasses it, and MLX would
+        # silently promote float32 audio against float16 weights rather than
+        # raise, diverging from the reference it claims to reproduce.
+        model = make_mlx_vad_model()
+        model.dtype = mx.float16
+        model._probs_to_timestamps.return_value = []
+        with patch(
+            "streamlit_app._mlx_vad_probabilities", return_value=mx.zeros((4,))
+        ) as mock_probs:
+            silero_vad(torch.zeros(1, 16000), model)
+        assert mock_probs.call_args[0][1].dtype == mx.float16
+
+    def test_both_backends_agree_on_real_audio(self) -> None:
+        """Real weights, real speech, both paths — spans must match exactly.
+
+        The tests above run random weights, so they prove the batching is
+        arithmetically equivalent but say nothing about the two *checkpoints*
+        agreeing. Pinning MLX_VAD_REVISION froze one side of that pair, not
+        both: `silero-vad` is an ordinary dependency, so a `uv lock` bumping it
+        to a future Silero release would leave the backends disagreeing with
+        nothing else to notice.
+
+        Skipped rather than failed when the repo cannot be fetched — an offline
+        CI run should not turn red over a network absence.
+        """
+        from silero_vad import load_silero_vad
+
+        from streamlit_app import _load_mlx_vad_model
+
+        try:
+            mlx_model = _load_mlx_vad_model(MLX_VAD_REPO)
+        except Exception as e:  # noqa: BLE001 - any failure means skip
+            pytest.skip(f"{MLX_VAD_REPO} unavailable: {e}")
+        if not _supports_mlx_vad(mlx_model):  # pragma: no cover - upstream drift
+            pytest.skip("mlx_audio VAD internals have moved")
+
+        wav = load_and_preprocess_audio(make_upload(AUDIO_DIR / "sample_10s.wav"))
+        assert silero_vad(wav, mlx_model) == silero_vad(wav, load_silero_vad())
 
 
 class TestGetSpeechSegments:
@@ -600,11 +873,35 @@ class TestLoadGuardianModel:
 
 @patch("streamlit_app.st")
 class TestLoadVadModel:
-    @patch("streamlit_app.load_silero_vad")
-    def test_loads_model(self, mock_load: MagicMock, _mock_st: MagicMock) -> None:
+    @patch("streamlit_app._load_mlx_vad_model")
+    def test_loads_the_mlx_model(
+        self, mock_load: MagicMock, _mock_st: MagicMock
+    ) -> None:
+        mock_load.return_value = make_mlx_vad_model()
         result = _load_vad_model()
-        mock_load.assert_called_once()
-        assert result == mock_load.return_value
+        mock_load.assert_called_once_with(MLX_VAD_REPO, revision=MLX_VAD_REVISION)
+        assert result is mock_load.return_value
+
+    @patch("streamlit_app._torch_vad_model")
+    @patch("streamlit_app._load_mlx_vad_model", side_effect=OSError("offline"))
+    def test_falls_back_when_the_repo_will_not_load(
+        self, _mock_mlx: MagicMock, mock_torch: MagicMock, _mock_st: MagicMock
+    ) -> None:
+        with pytest.warns(RuntimeWarning, match="using the PyTorch VAD"):
+            result = _load_vad_model()
+        assert result is mock_torch.return_value
+
+    @patch("streamlit_app._torch_vad_model")
+    @patch("streamlit_app._load_mlx_vad_model")
+    def test_falls_back_when_the_internals_have_moved(
+        self, mock_mlx: MagicMock, mock_torch: MagicMock, _mock_st: MagicMock
+    ) -> None:
+        # A rename upstream must degrade to the slower-but-correct path, not
+        # surface as a crash on the first pipeline run.
+        mock_mlx.return_value = make_mlx_vad_model(drop="_probs_to_timestamps")
+        with pytest.warns(RuntimeWarning, match="internals have moved"):
+            result = _load_vad_model()
+        assert result is mock_torch.return_value
 
 
 # ---------------------------------------------------------------------------
