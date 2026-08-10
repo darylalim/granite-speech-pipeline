@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx  # ty: ignore[unresolved-import]
 import numpy as np
 import pytest
 import torch
 
 from streamlit_app import (
+    _HOIST_ATTRS,
     EN_TARGETS,
     GUARDIAN_MODEL_ID,
     MAX_SEGMENT_DURATION_S,
@@ -22,6 +24,8 @@ from streamlit_app import (
     VIDEO_FORMATS,
     PipelineResult,
     _aggregate_segment_safety,
+    _encode_segment,
+    _generate_from_features,
     _render_result_card,
     _row_sizes,
     _split_long_segment,
@@ -524,6 +528,18 @@ class TestLoadAndPreprocessAudio:
         assert wav.shape[0] == 1
         assert wav.shape[1] > 0
 
+    def test_zero_sample_audio_raises_a_readable_error(self) -> None:
+        # Caught at load, not downstream: an empty waveform passes VAD (which
+        # falls back to a zero-length segment) and would otherwise die as an
+        # opaque reshape error inside the mel filterbank.
+        with (
+            patch(
+                "streamlit_app.torchaudio.load", return_value=(torch.zeros(1, 0), 16000)
+            ),
+            pytest.raises(RuntimeError, match="No audio detected"),
+        ):
+            load_and_preprocess_audio(make_upload(AUDIO_DIR / "sample_10s.wav"))
+
     def test_invalid_audio_raises_runtime_error(self) -> None:
         with pytest.raises(RuntimeError, match="Failed to load audio file"):
             load_and_preprocess_audio(make_upload(raw=b"not audio data"))
@@ -1010,6 +1026,80 @@ class TestRunPipeline:
     def test_hoist_requires_every_internal(self, attrs: list[str]) -> None:
         assert _supports_encoder_hoist(MagicMock(spec=attrs)) is False
 
+    def test_signature_drift_warns_and_falls_back(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        # All five names present, so the hasattr probe says yes, but the call
+        # raises — the shape an upstream signature change actually takes.
+        model = MagicMock()
+        model._extract_features.side_effect = TypeError("unexpected keyword")
+        model.generate.return_value = MagicMock(text="fallback text")
+        assert _supports_encoder_hoist(model) is True
+        with (
+            patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S),
+            pytest.warns(RuntimeWarning, match="Encoder hoist failed"),
+        ):
+            results = _run_pipeline(
+                torch.zeros(1, 48000),
+                TRANSCRIBE_PLUS_ONE,
+                set(),
+                model,
+                *pipeline_mocks[1:],
+            )
+        assert model.generate.call_count == 4  # 2 segments x 2 tasks
+        assert "fallback text" in results["Transcribe"]["transcript"]
+
+    def test_hoist_is_not_retried_after_it_fails(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        model = MagicMock()
+        model._extract_features.side_effect = TypeError("boom")
+        model.generate.return_value = MagicMock(text="t")
+        with (
+            patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S),
+            pytest.warns(RuntimeWarning),
+        ):
+            _run_pipeline(
+                torch.zeros(1, 48000),
+                TRANSCRIBE_PLUS_ONE,
+                set(),
+                model,
+                *pipeline_mocks[1:],
+            )
+        # Disabled for the whole run, not re-attempted once per segment.
+        assert model._extract_features.call_count == 1
+
+    def test_progress_reaches_full_before_the_safety_pass(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        calls: list[tuple[int, int, str]] = []
+        with patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S):
+            _run_pipeline(
+                torch.zeros(1, 48000),
+                TRANSCRIBE_PLUS_ONE,
+                {"Transcribe"},
+                *pipeline_mocks,
+                on_progress=lambda i, total, task: calls.append((i, total, task)),
+            )
+        # The guardian pass is real work; the bar must not sit at (total-1)/total
+        # and keep naming the task that already finished.
+        assert calls[-1] == (4, 4, "safety check")
+        assert calls[0] == (0, 4, "Transcribe")
+
+    def test_progress_final_label_when_no_safety_pass(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        calls: list[tuple[int, int, str]] = []
+        with patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S):
+            _run_pipeline(
+                torch.zeros(1, 48000),
+                TRANSCRIBE_PLUS_ONE,
+                set(),
+                *pipeline_mocks,
+                on_progress=lambda i, total, task: calls.append((i, total, task)),
+            )
+        assert calls[-1] == (4, 4, "results")
+
     def test_keywords_applied_to_transcription_only(
         self, pipeline_mocks: PipelineMocks
     ) -> None:
@@ -1029,6 +1119,83 @@ class TestRunPipeline:
             f"{TRANSCRIBE_PROMPT} Keywords: IBM, MLX",
             "translate to French",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Encoder-hoist internals
+# ---------------------------------------------------------------------------
+
+
+class TestEncoderHoistInternals:
+    """Drives the real _encode_segment / _generate_from_features bodies.
+
+    Every other test patches both out, and the pipeline mocks are spec'd so the
+    hoist is never taken — so without this class the code reaching into
+    mlx_audio and mlx_lm internals never executes in CI, and an upstream
+    signature change would ship green. _supports_encoder_hoist cannot help:
+    it only checks that names exist.
+    """
+
+    @staticmethod
+    def _stub_model() -> MagicMock:
+        model = MagicMock()
+        model._extract_features.return_value = (mx.zeros((1, 4, 8)), 7)
+        model.get_audio_features.return_value = mx.zeros((1, 7, 8))
+        model._build_prompt.return_value = mx.zeros((1, 5), dtype=mx.int32)
+        model._build_inputs_embeds.return_value = mx.zeros((1, 5, 8))
+        model._tokenizer.eos_token_id = 99
+        model._tokenizer.decode.return_value = "stub transcript"
+        return model
+
+    def test_encode_segment_returns_features_and_token_count(self) -> None:
+        model = self._stub_model()
+        features, num_tokens = _encode_segment(torch.zeros(1, 16000), model)
+        assert num_tokens == 7
+        assert features.shape == (1, 7, 8)
+        # mlx_audio takes a numpy array, not a torch tensor.
+        (audio,) = model._extract_features.call_args[0]
+        assert isinstance(audio, np.ndarray)
+
+    def test_generate_from_features_stops_at_eos(self) -> None:
+        model = self._stub_model()
+        with patch(
+            "mlx_lm.generate.generate_step",
+            return_value=iter([(1, None), (2, None), (99, None), (3, None)]),
+        ):
+            text = _generate_from_features(mx.zeros((1, 7, 8)), 7, "prompt", model)
+        assert text == "stub transcript"
+        tokens = model._tokenizer.decode.call_args[0][0]
+        assert tokens == [1, 2]  # stops at eos, and does not emit it
+        assert model._tokenizer.decode.call_args[1] == {"skip_special_tokens": True}
+
+    def test_generate_from_features_holds_the_mlx_lm_contract(self) -> None:
+        model = self._stub_model()
+        with patch(
+            "mlx_lm.generate.generate_step", return_value=iter([(99, None)])
+        ) as gen:
+            _generate_from_features(mx.zeros((1, 7, 8)), 7, "a prompt", model)
+        # These six kwargs are the contract with mlx_lm. A rename there is
+        # exactly the drift the hasattr probe cannot see.
+        assert set(gen.call_args[1]) == {
+            "prompt",
+            "input_embeddings",
+            "model",
+            "max_tokens",
+            "sampler",
+            "prefill_step_size",
+        }
+        model._build_prompt.assert_called_once_with(7, "a prompt")
+
+    def test_real_granite_model_class_still_exposes_the_internals(self) -> None:
+        # Guards the actual installed mlx_audio, which the stubs above cannot.
+        granite = pytest.importorskip("mlx_audio.stt.models.granite_speech")
+        missing = [
+            attr
+            for attr in _HOIST_ATTRS
+            if attr != "_tokenizer"  # set per-instance at load time
+            and not hasattr(granite.Model, attr)
+        ]
+        assert not missing, f"mlx_audio drift: {missing}"
 
 
 # ---------------------------------------------------------------------------

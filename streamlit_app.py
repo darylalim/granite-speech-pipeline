@@ -280,6 +280,12 @@ def load_and_preprocess_audio(audio_file: UploadedFile) -> torch.Tensor:
     except Exception as e:
         raise RuntimeError(f"Failed to load audio file: {e}") from e
 
+    # Caught here rather than downstream: an empty waveform survives VAD (which
+    # falls back to a zero-length full-audio segment) and only dies inside the
+    # mel filterbank, as an opaque reshape error on zero rows.
+    if wav.numel() == 0:
+        raise RuntimeError("No audio detected: the file decoded to zero samples.")
+
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     if sr != SAMPLE_RATE:
@@ -361,6 +367,11 @@ def transcribe_audio(
 # They reach into mlx_audio internals, so `_supports_encoder_hoist` gates them
 # and run_pipeline falls back to the public `transcribe_audio` path when a
 # future version renames something. The fallback is correct, just slower.
+#
+# The name probe only catches renames. A changed signature or return shape
+# passes it and raises at call time, so run_pipeline also wraps the first
+# `_encode_segment` and disables the hoist on any exception — with a
+# RuntimeWarning, because an unexplained 28% slowdown is near-undiagnosable.
 _HOIST_ATTRS = (
     "_extract_features",
     "get_audio_features",
@@ -471,7 +482,26 @@ def run_pipeline(
         start_sample = int(seg["start"] * SAMPLE_RATE)
         end_sample = int(seg["end"] * SAMPLE_RATE)
         chunk = wav[:, start_sample:end_sample]
-        encoded = _encode_segment(chunk, model) if hoist else None
+        if hoist:
+            try:
+                encoded = _encode_segment(chunk, model)
+            except Exception as e:  # noqa: BLE001 - any drift disables the hoist
+                # _supports_encoder_hoist only proves the names exist. A changed
+                # signature or return shape gets this far, and without the catch
+                # it kills the whole run. Warn rather than degrade quietly: the
+                # public path is correct, just ~28% slower, and a silent
+                # slowdown is close to undiagnosable.
+                warnings.warn(
+                    f"Encoder hoist failed ({type(e).__name__}: {e}); falling "
+                    "back to the slower per-task encode. mlx_audio internals "
+                    "have probably changed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                hoist = False
+                encoded = None
+        else:
+            encoded = None
         ts_start = format_timestamp(seg["start"])
         ts_end = format_timestamp(seg["end"])
         for task, actual_prompt in prompts.items():
@@ -486,6 +516,12 @@ def run_pipeline(
             lines[task].append(f"[{ts_start} - {ts_end}] {text}")
 
     results: dict[str, PipelineResult] = {}
+    if on_progress:
+        # The guardian pass below is real work. Without this the bar would sit
+        # frozen at (total-1)/total for its whole duration, still labelled with
+        # the task that already finished.
+        checking = bool(safety_tasks) and guardian_model is not None
+        on_progress(total_steps, total_steps, "safety check" if checking else "results")
     for task in tasks:
         result: PipelineResult = {"transcript": "\n".join(lines[task])}
         if (
