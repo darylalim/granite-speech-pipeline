@@ -5,7 +5,7 @@ exercises the UI wiring). AppTest re-executes streamlit_app.py in a fresh
 namespace on every .run(), so mocks must patch the SHARED upstream imports
 (mlx_audio, torchcodec) rather than streamlit_app.* — patching streamlit_app
 attributes does not cross AppTest's script-runner boundary, and clicking Run
-without an upstream patch would load the real ~2.9GB speech model.
+without an upstream patch would load the real ~3.3GB speech model.
 """
 
 import tomllib
@@ -106,8 +106,9 @@ def test_source_change_resets_tasks() -> None:
 
 
 def test_vad_off_long_audio_disables_run(audio_bytes: bytes) -> None:
-    """With VAD off and audio over the 5-minute limit, Run is disabled and a
-    warning is shown."""
+    """With VAD off and audio over MAX_VAD_OFF_DURATION_S, Run is disabled and a
+    warning is shown. Matched on the stable prefix rather than the minute count
+    so retuning the constant doesn't break this test."""
     with patch("torchcodec.decoders.AudioDecoder") as decoder:
         decoder.return_value.metadata.duration_seconds = 600.0
         at = _app().run()
@@ -117,7 +118,7 @@ def test_vad_off_long_audio_disables_run(audio_bytes: bytes) -> None:
         at.run()
     assert at.button[0].disabled is True
     vad_warning = next(
-        (w for w in at.warning if "longer than 5 minutes" in w.value), None
+        (w for w in at.warning if w.value.startswith("Enable VAD segmentation")), None
     )
     assert vad_warning is not None
     assert vad_warning.icon == ":material/warning:"
@@ -145,7 +146,9 @@ def test_duration_cache_is_single_slot(audio_bytes: bytes) -> None:
 def test_run_renders_result_card(audio_bytes: bytes) -> None:
     """Clicking Run with mocked inference renders a result card. Patches the
     upstream MLX loader so no real model loads."""
-    fake_model = MagicMock()
+    # spec= excludes the mlx_audio internals _supports_encoder_hoist probes
+    # for, so the app takes the public generate() path against this fake.
+    fake_model = MagicMock(spec=["generate"])
     fake_model.generate.return_value.text = "the quick brown fox (mocked)"
     with patch("mlx_audio.stt.utils.load_model", return_value=fake_model) as loader:
         at = _app().run()
@@ -162,13 +165,22 @@ def test_run_renders_result_card(audio_bytes: bytes) -> None:
 
 
 def test_run_renders_multiple_result_cards(audio_bytes: bytes) -> None:
-    """Transcribe + one translation drives the CoT-AST path and the multi-card
-    result grid (the N>1 _row_sizes -> st.columns loop in main()), which the
-    single-task Run test does not exercise."""
-    fake_model = MagicMock()
-    fake_model.generate.return_value.text = (
-        "[Transcription] hello world [Translation] bonjour le monde"
-    )
+    """Transcribe + one translation drives the multi-card result grid (the
+    N>1 _row_sizes -> st.columns loop in main()), which the single-task Run
+    test does not exercise."""
+    # spec= excludes the mlx_audio internals _supports_encoder_hoist probes
+    # for, so the app takes the public generate() path against this fake.
+    fake_model = MagicMock(spec=["generate"])
+
+    # Key the fake off the prompt, not call order: this asserts the real
+    # intent (each task's own prompt drives its own card) and stays correct
+    # if task iteration order or inference count ever changes.
+    def by_prompt(*_args: object, prompt: str = "", **_kwargs: object) -> MagicMock:
+        return MagicMock(
+            text="bonjour le monde" if "French" in prompt else "hello world"
+        )
+
+    fake_model.generate.side_effect = by_prompt
     with patch("mlx_audio.stt.utils.load_model", return_value=fake_model):
         at = _app().run()
         at.file_uploader[0].set_value(("sample_10s.wav", audio_bytes, "audio/wav"))
@@ -180,7 +192,7 @@ def test_run_renders_multiple_result_cards(audio_bytes: bytes) -> None:
         at.run()
     assert not at.exception
     assert {s.value for s in at.subheader} == {"Transcribe (English)", "French"}
-    # CoT output is split: transcription -> Transcribe card, translation -> French.
+    # Each task's own inference lands on its own card.
     texts = " ".join(t.value for t in at.text)
     assert "hello world" in texts
     assert "bonjour le monde" in texts

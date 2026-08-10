@@ -11,17 +11,17 @@ from streamlit_app import (
     EN_TARGETS,
     GUARDIAN_MODEL_ID,
     MAX_VAD_OFF_DURATION_S,
+    MAX_SEGMENT_DURATION_S,
     MODEL_ID,
+    MODEL_REVISION,
     SOURCE_LANGUAGES,
     SUPPORTED_FORMATS,
     TRANSCRIBE_PROMPT,
     VIDEO_FORMATS,
     PipelineResult,
     _aggregate_segment_safety,
-    _cot_prompt,
-    _detect_cot_target,
-    _parse_cot_output,
     _render_result_card,
+    _supports_encoder_hoist,
     _row_sizes,
     apply_keywords,
     audio_duration_seconds,
@@ -88,7 +88,11 @@ class PipelineMocks(NamedTuple):
 
 @pytest.fixture
 def pipeline_mocks() -> PipelineMocks:
-    model = MagicMock()
+    # spec= keeps the mock from auto-creating the mlx_audio internals that
+    # _supports_encoder_hoist probes for, so these tests drive the public
+    # model.generate() fallback path and can assert on generate.call_count.
+    # The hoisted path has its own tests below.
+    model = MagicMock(spec=["generate"])
     model.generate.return_value = MagicMock(text="decoded text")
     guardian_tokenizer = MagicMock()
     guardian_tokenizer.return_value = {"input_ids": torch.tensor([[1, 2, 3]])}
@@ -103,7 +107,7 @@ def pipeline_mocks() -> PipelineMocks:
 
 
 def test_model_id() -> None:
-    assert MODEL_ID == "mlx-community/granite-4.0-1b-speech-8bit"
+    assert MODEL_ID == "divydeep/granite-speech-4.1-2b-mlx-8bit"
 
 
 def test_guardian_model_id() -> None:
@@ -145,7 +149,7 @@ def test_supported_formats() -> None:
 
 
 def test_max_vad_off_duration_is_five_minutes() -> None:
-    assert MAX_VAD_OFF_DURATION_S == 300
+    assert MAX_VAD_OFF_DURATION_S == 120
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +163,7 @@ class TestBuildTasks:
         assert tasks["Transcribe"] == TRANSCRIBE_PROMPT
         assert "English" not in tasks
         assert set(tasks) - {"Transcribe"} == set(EN_TARGETS)
-        # Insertion order matters: Transcribe must come first for CoT cache.
+        # Insertion order drives result-card order: Transcribe comes first.
         assert next(iter(tasks)) == "Transcribe"
 
     @pytest.mark.parametrize("source", NON_ENGLISH_SOURCES)
@@ -194,7 +198,9 @@ PRODUCES_ENGLISH_CASES = [
     ("English", "Transcribe", True),
     *[(src, "Transcribe", False) for src in NON_ENGLISH_SOURCES],
     *[(src, "English", True) for src in NON_ENGLISH_SOURCES],
-    *[("English", target, False) for target in EN_TARGETS],
+    # English audio: every target can come back as English passthrough, so all
+    # of them must be scored.
+    *[("English", target, True) for target in EN_TARGETS],
 ]
 
 
@@ -219,11 +225,22 @@ def test_produces_english(source: str, task: str, expected: bool) -> None:
             ["English"], "French", True, {"English"}, id="translation_to_english"
         ),
         pytest.param(
+            # English audio: translations can passthrough as English, so they
+            # are scored too rather than silently skipped.
             ["Transcribe", "French", "German"],
             "English",
             True,
-            {"Transcribe"},
-            id="mixed_filters_non_english",
+            {"Transcribe", "French", "German"},
+            id="english_source_scores_every_task",
+        ),
+        pytest.param(
+            # French audio: Transcribe emits French and passthrough would too,
+            # so only the English translation is scored.
+            ["Transcribe", "English"],
+            "French",
+            True,
+            {"English"},
+            id="non_english_source_scores_english_target_only",
         ),
     ],
 )
@@ -306,34 +323,6 @@ def test_is_video(filename: str, expected: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    "tasks, expected",
-    [
-        pytest.param(
-            {"Transcribe": "p1", "French": "p2"}, "French", id="transcribe_plus_one"
-        ),
-        pytest.param({"French": "p1"}, None, id="no_transcribe"),
-        pytest.param({"Transcribe": "p1"}, None, id="only_transcribe"),
-        pytest.param(
-            {"Transcribe": "p1", "French": "p2", "German": "p3"},
-            None,
-            id="multi_targets",
-        ),
-        pytest.param({}, None, id="empty"),
-    ],
-)
-def test_detect_cot_target(tasks: dict[str, str], expected: str | None) -> None:
-    assert _detect_cot_target(tasks) == expected
-
-
-def test_cot_prompt_format() -> None:
-    assert (
-        _cot_prompt("French")
-        == "Can you transcribe the speech, and then translate it to French?"
-    )
-    assert "Mandarin Chinese" in _cot_prompt("Mandarin Chinese")
-
-
-@pytest.mark.parametrize(
     "n, expected",
     [
         pytest.param(0, [], id="zero"),
@@ -349,33 +338,6 @@ def test_cot_prompt_format() -> None:
 )
 def test_row_sizes(n: int, expected: list[int]) -> None:
     assert _row_sizes(n) == expected
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        pytest.param(
-            "[Transcription] hello world [Translation] bonjour le monde",
-            ("hello world", "bonjour le monde"),
-            id="well_formed",
-        ),
-        pytest.param("just a plain transcript", ("", ""), id="no_tags"),
-        pytest.param("[Transcription] hello", ("hello", ""), id="only_transcription"),
-        pytest.param("[Translation] bonjour", ("", "bonjour"), id="only_translation"),
-        pytest.param(
-            "[Transcription] line one\nline two [Translation] bonjour\nle monde",
-            ("line one\nline two", "bonjour\nle monde"),
-            id="multiline",
-        ),
-        pytest.param(
-            "[Transcription]   hello   [Translation]   bonjour   ",
-            ("hello", "bonjour"),
-            id="strips_whitespace",
-        ),
-    ],
-)
-def test_parse_cot_output(text: str, expected: tuple[str, str]) -> None:
-    assert _parse_cot_output(text) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +372,14 @@ class TestSileroVad:
 class TestGetSpeechSegments:
     @staticmethod
     def _run(
-        wav: torch.Tensor, vad_segments: list[tuple[float, float]]
+        wav: torch.Tensor,
+        vad_segments: list[tuple[float, float]],
+        max_segment_duration: float = MAX_SEGMENT_DURATION_S,
     ) -> list[dict[str, float]]:
         with patch("streamlit_app.silero_vad", return_value=vad_segments):
-            return get_speech_segments(wav, MagicMock())
+            return get_speech_segments(
+                wav, MagicMock(), max_segment_duration=max_segment_duration
+            )
 
     def test_adds_start_and_end_buffer(self) -> None:
         result = self._run(torch.zeros(1, 160000), [(1.0, 2.0)])
@@ -440,8 +406,64 @@ class TestGetSpeechSegments:
         assert len(result) == 2
 
     def test_no_speech_falls_back_to_full_audio(self) -> None:
-        # 10 seconds at 16 kHz
-        assert self._run(torch.zeros(1, 160000), []) == [{"start": 0.0, "end": 10.0}]
+        # 10 seconds at 16 kHz, covered end to end but still subject to the cap.
+        result = self._run(torch.zeros(1, 160000), [])
+        assert result[0]["start"] == 0.0
+        assert result[-1]["end"] == pytest.approx(10.0)
+        assert all(
+            seg["end"] - seg["start"] <= MAX_SEGMENT_DURATION_S + 1e-6 for seg in result
+        )
+
+    def test_merge_stops_at_max_duration(self) -> None:
+        # Both spans are within min_gap, so the old code merged them into one
+        # 9.3s segment. With a 5s cap the merge must not happen.
+        result = self._run(
+            torch.zeros(1, 160000), [(1.0, 5.0), (5.2, 9.0)], max_segment_duration=5.0
+        )
+        assert len(result) == 2
+
+    def test_continuous_speech_does_not_collapse_into_one_segment(self) -> None:
+        # 60s of speech with sub-min_gap breaks: previously one 60s segment.
+        vad = [(float(i), i + 0.9) for i in range(60)]
+        result = self._run(torch.zeros(1, 16000 * 60), vad, max_segment_duration=10.0)
+        assert len(result) > 1
+        assert all(seg["end"] - seg["start"] <= 10.0 + 1e-6 for seg in result)
+
+    def test_single_long_span_is_split_into_equal_parts(self) -> None:
+        # One unbroken 30s span, 10s cap -> 3 equal parts, not 10+10+10 by
+        # chance: 31s would be 4 x 7.75s rather than 3 x 10s + 1s.
+        result = self._run(
+            torch.zeros(1, 16000 * 40), [(0.3, 31.3)], max_segment_duration=10.0
+        )
+        assert len(result) == 4
+        durations = [seg["end"] - seg["start"] for seg in result]
+        assert all(d == pytest.approx(durations[0]) for d in durations)
+        assert all(d <= 10.0 + 1e-6 for d in durations)
+
+    def test_split_parts_are_contiguous_and_cover_the_span(self) -> None:
+        result = self._run(
+            torch.zeros(1, 16000 * 40), [(0.3, 31.3)], max_segment_duration=10.0
+        )
+        assert result[0]["start"] == pytest.approx(0.0)
+        assert result[-1]["end"] == pytest.approx(31.6)
+        for earlier, later in zip(result, result[1:]):
+            assert earlier["end"] == pytest.approx(later["start"])
+
+    def test_no_speech_fallback_is_also_capped(self) -> None:
+        result = self._run(torch.zeros(1, 16000 * 25), [], max_segment_duration=10.0)
+        assert len(result) == 3
+        assert all(seg["end"] - seg["start"] <= 10.0 + 1e-6 for seg in result)
+
+    def test_short_segments_are_untouched(self) -> None:
+        result = self._run(
+            torch.zeros(1, 160000), [(1.0, 2.0)], max_segment_duration=10.0
+        )
+        assert result == [{"start": pytest.approx(0.7), "end": pytest.approx(2.3)}]
+
+    def test_default_cap_is_below_the_measured_translation_cliff(self) -> None:
+        # 20s+ segments collapse to source-language passthrough; the default
+        # must stay under that with margin.
+        assert 0 < MAX_SEGMENT_DURATION_S <= 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +506,15 @@ class TestLoadModel:
         self, mock_load: MagicMock, _mock_st: MagicMock
     ) -> None:
         result = _load_model("test-model")
-        mock_load.assert_called_once_with("test-model")
+        mock_load.assert_called_once_with("test-model", revision=None)
         assert result == mock_load.return_value
+
+    @patch("streamlit_app._load_stt_model")
+    def test_forwards_revision_pin(
+        self, mock_load: MagicMock, _mock_st: MagicMock
+    ) -> None:
+        _load_model(MODEL_ID, MODEL_REVISION)
+        mock_load.assert_called_once_with(MODEL_ID, revision=MODEL_REVISION)
 
 
 @patch("streamlit_app.st")
@@ -634,8 +663,7 @@ class TestTranscribeAudio:
 # ---------------------------------------------------------------------------
 
 SEGMENTS_3S = [{"start": 0.0, "end": 1.5}, {"start": 1.5, "end": 3.0}]
-COT_TEXT = "[Transcription] hello [Translation] bonjour"
-COT_TASKS = {"Transcribe": TRANSCRIBE_PROMPT, "French": "translate to French"}
+TRANSCRIBE_PLUS_ONE = {"Transcribe": TRANSCRIBE_PROMPT, "French": "translate to French"}
 
 
 class TestRunPipeline:
@@ -792,7 +820,7 @@ class TestRunPipeline:
     def test_multi_segment_safety_reports_max_score(self) -> None:
         # A single toxic segment must flag the whole transcript, even when
         # surrounded by safe segments — i.e., aggregation is max, not mean.
-        model = MagicMock()
+        model = MagicMock(spec=["generate"])
         model.generate.return_value = MagicMock(text="decoded text")
         tokenizer = MagicMock()
         tokenizer.return_value = {"input_ids": torch.tensor([[1, 2, 3]])}
@@ -865,120 +893,96 @@ class TestRunPipeline:
         assert pipeline_mocks.model.generate.call_count == 1
         assert "[0:00 - 0:03]" in results["Transcribe"]["transcript"]
 
-    def test_cot_optimization_reduces_inference_count(
+    def test_transcribe_plus_one_translation_gets_no_special_casing(
         self, pipeline_mocks: PipelineMocks
     ) -> None:
-        pipeline_mocks.model.generate.return_value = MagicMock(text=COT_TEXT)
+        # Transcribe + exactly one translation used to trigger a combined
+        # chain-of-thought prompt. The model never emitted the [Transcription]
+        # / [Translation] tags that path parsed for, so it always fell back —
+        # costing an extra inference per segment. Each task now runs its own
+        # inference: 2 segments x 2 tasks = 4 calls, no more, no fewer.
         with patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S):
-            _run_pipeline(torch.zeros(1, 48000), COT_TASKS, set(), *pipeline_mocks)
-        # 2 segments × {Transcribe + French} would be 4 calls without CoT;
-        # CoT collapses each segment to a single shared inference.
-        assert pipeline_mocks.model.generate.call_count == 2
-
-    def test_cot_uses_cot_prompt_for_transcribe(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        pipeline_mocks.model.generate.return_value = MagicMock(text=COT_TEXT)
-        _run_pipeline(torch.zeros(1, 16000), COT_TASKS, set(), *pipeline_mocks)
-        calls = pipeline_mocks.model.generate.call_args_list
-        assert len(calls) == 1
-        assert (
-            calls[0][1]["prompt"]
-            == "Can you transcribe the speech, and then translate it to French?"
-        )
-
-    def test_cot_splits_output_into_two_results(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        pipeline_mocks.model.generate.return_value = MagicMock(
-            text="[Transcription] hello world [Translation] bonjour le monde"
-        )
-        results = _run_pipeline(
-            torch.zeros(1, 16000), COT_TASKS, set(), *pipeline_mocks
-        )
-        assert "hello world" in results["Transcribe"]["transcript"]
-        assert "bonjour le monde" in results["French"]["transcript"]
-
-    def test_cot_parse_failure_falls_back_to_direct_ast(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        # When CoT output lacks tags, the Transcribe iteration must NOT use
-        # raw output (could be a translation); it must re-run a direct ASR
-        # call. The French iteration then makes its own direct AST call.
-        pipeline_mocks.model.generate.side_effect = [
-            MagicMock(text="untagged cot output"),
-            MagicMock(text="direct asr transcript"),
-            MagicMock(text="translated text"),
-        ]
-        results = _run_pipeline(
-            torch.zeros(1, 16000), COT_TASKS, set(), *pipeline_mocks
-        )
-        assert "direct asr transcript" in results["Transcribe"]["transcript"]
-        assert "translated text" in results["French"]["transcript"]
-        assert "untagged cot output" not in results["Transcribe"]["transcript"]
-        assert pipeline_mocks.model.generate.call_count == 3
-
-    def test_cot_only_translation_tag_runs_asr_fallback(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        # Model emitted just [Translation]: Transcribe must NOT be left empty
-        # — re-run ASR for it. French still uses the cached translation.
-        pipeline_mocks.model.generate.side_effect = [
-            MagicMock(text="[Translation] bonjour"),
-            MagicMock(text="direct asr transcript"),
-        ]
-        results = _run_pipeline(
-            torch.zeros(1, 16000), COT_TASKS, set(), *pipeline_mocks
-        )
-        assert "direct asr transcript" in results["Transcribe"]["transcript"]
-        assert "bonjour" in results["French"]["transcript"]
-        assert pipeline_mocks.model.generate.call_count == 2
-
-    def test_cot_only_transcription_tag_runs_direct_ast(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        # Model emitted just [Transcription]: Transcribe is fine, but the
-        # missing translation must trigger a direct AST call rather than
-        # serving an empty cached value.
-        pipeline_mocks.model.generate.side_effect = [
-            MagicMock(text="[Transcription] hello"),
-            MagicMock(text="direct ast translation"),
-        ]
-        results = _run_pipeline(
-            torch.zeros(1, 16000), COT_TASKS, set(), *pipeline_mocks
-        )
-        assert "hello" in results["Transcribe"]["transcript"]
-        assert "direct ast translation" in results["French"]["transcript"]
-        assert pipeline_mocks.model.generate.call_count == 2
-
-    def test_cot_not_triggered_for_multi_target(
-        self, pipeline_mocks: PipelineMocks
-    ) -> None:
-        tasks = {"Transcribe": TRANSCRIBE_PROMPT, "French": "p2", "German": "p3"}
-        _run_pipeline(torch.zeros(1, 16000), tasks, set(), *pipeline_mocks)
-        assert pipeline_mocks.model.generate.call_count == 3
-        for call in pipeline_mocks.model.generate.call_args_list:
-            assert (
-                "Can you transcribe the speech, and then translate it"
-                not in call[1]["prompt"]
+            _run_pipeline(
+                torch.zeros(1, 48000), TRANSCRIBE_PLUS_ONE, set(), *pipeline_mocks
             )
+        assert pipeline_mocks.model.generate.call_count == 4
+        prompts = [c[1]["prompt"] for c in pipeline_mocks.model.generate.call_args_list]
+        # Segments outer, tasks inner: both tasks run against segment 1 before
+        # segment 2, which is what lets the encoder be hoisted per segment.
+        assert prompts == [TRANSCRIBE_PROMPT, "translate to French"] * 2
 
-    def test_cot_appends_keywords_to_prompt(
+    def test_encoder_hoisted_when_model_supports_it(
         self, pipeline_mocks: PipelineMocks
     ) -> None:
-        pipeline_mocks.model.generate.return_value = MagicMock(text=COT_TEXT)
+        # A model exposing the mlx_audio internals takes the hoisted path:
+        # one encode per segment, one decode per (segment, task) — not one
+        # encode per pair.
+        model = MagicMock()  # unspec'd: has every _HOIST_ATTRS attribute
+        with (
+            patch("streamlit_app.get_speech_segments", return_value=SEGMENTS_3S),
+            patch(
+                "streamlit_app._encode_segment", return_value=("features", 7)
+            ) as encode,
+            patch(
+                "streamlit_app._generate_from_features", return_value="text"
+            ) as decode,
+        ):
+            _run_pipeline(
+                torch.zeros(1, 48000),
+                TRANSCRIBE_PLUS_ONE,
+                set(),
+                model,
+                *pipeline_mocks[1:],
+            )
+        assert encode.call_count == 2  # 2 segments
+        assert decode.call_count == 4  # 2 segments x 2 tasks
+        assert model.generate.call_count == 0  # public path not used
+
+    def test_falls_back_to_generate_when_internals_absent(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        # pipeline_mocks.model is spec'd to `generate` only, so the hoist is
+        # unavailable and the public path must still produce results.
+        with patch("streamlit_app._encode_segment") as encode:
+            results = _run_pipeline(
+                torch.zeros(1, 16000), TRANSCRIBE_PLUS_ONE, set(), *pipeline_mocks
+            )
+        encode.assert_not_called()
+        assert pipeline_mocks.model.generate.call_count == 2
+        assert set(results) == {"Transcribe", "French"}
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            pytest.param(["generate"], id="none_present"),
+            pytest.param(
+                ["generate", "_extract_features", "get_audio_features"],
+                id="partially_present",
+            ),
+        ],
+    )
+    def test_hoist_requires_every_internal(self, attrs: list[str]) -> None:
+        assert _supports_encoder_hoist(MagicMock(spec=attrs)) is False
+
+    def test_keywords_applied_to_transcription_only(
+        self, pipeline_mocks: PipelineMocks
+    ) -> None:
+        # The UI promises keywords are "boosted during transcription", and
+        # appending them to a translation prompt makes the model fall back to
+        # untranslated, truncated source text. Transcribe gets them; translation
+        # targets must not.
         _run_pipeline(
             torch.zeros(1, 16000),
-            COT_TASKS,
+            TRANSCRIBE_PLUS_ONE,
             set(),
             *pipeline_mocks,
             keywords=["IBM", "MLX"],
         )
-        prompt = pipeline_mocks.model.generate.call_args[1]["prompt"]
-        assert (
-            "Can you transcribe the speech, and then translate it to French?" in prompt
-        )
-        assert "Keywords: IBM, MLX" in prompt
+        prompts = [c[1]["prompt"] for c in pipeline_mocks.model.generate.call_args_list]
+        assert prompts == [
+            f"{TRANSCRIBE_PROMPT} Keywords: IBM, MLX",
+            "translate to French",
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -14,12 +14,12 @@ Streamlit application for transcription and translation using IBM Granite Speech
 
 ## Features
 
-- **Pipeline processing** — run multiple transcription and translation tasks on the same audio (Transcribe + one translation runs as a single inference per segment via chain-of-thought prompting)
+- **Pipeline processing** — run multiple transcription and translation tasks on the same audio in one pass over the file
 - **Transcription** — English, French, German, Spanish, Portuguese, Japanese
 - **Translation** — English ↔ French, German, Spanish, Portuguese, Italian, Japanese, Mandarin Chinese (Italian and Mandarin: English source only)
 - **Keywords** — bias recognition toward up to 15 user-provided terms (proper nouns, acronyms, jargon)
-- **VAD segmentation** — automatic speech detection with timestamped per-segment output (togglable; disable to process whole audio in one pass; auto-required for audio over 5 minutes)
-- **Toxicity check** — togglable (on by default); surfaces the worst per-segment toxicity score on English output (transcription or translation to English) via Granite Guardian HAP 125m
+- **VAD segmentation** — automatic speech detection with timestamped per-segment output, capped at 8s per segment so translation stays accurate on continuous speech (togglable; disable to process whole audio in one pass; auto-required for audio over 2 minutes)
+- **Toxicity check** — togglable (on by default); surfaces the worst per-segment toxicity score on any output that may be English via Granite Guardian HAP 125m
 - **Source language** — pick once; valid tasks update accordingly
 - **Audio input** — upload audio (WAV, FLAC, M4A, MP3, OGG, AAC) or video (MP4, MOV, WebM, MKV — audio track is extracted) or record from microphone
 - **Side-by-side results** — compare outputs in a column grid (up to 3 columns)
@@ -33,11 +33,11 @@ Three models run as a pipeline, loaded on first run and cached thereafter:
 
 | Model | Role | Runs on |
 |-------|------|---------|
-| [Granite 4.0 1B Speech (8-bit, MLX)](https://huggingface.co/mlx-community/granite-4.0-1b-speech-8bit) | Transcription and translation | Apple GPU (MLX) |
+| [Granite Speech 4.1 2B (8-bit, MLX)](https://huggingface.co/divydeep/granite-speech-4.1-2b-mlx-8bit) | Transcription and translation | Apple GPU (MLX) |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | Splits audio into speech segments | CPU |
 | [Granite Guardian HAP 125m](https://huggingface.co/ibm-granite/granite-guardian-hap-125m) | English toxicity detection | CPU |
 
-Audio is loaded and resampled to 16 kHz mono, optionally segmented with VAD, then transcribed and translated segment-by-segment on the GPU. English output (English-source transcription or translation into English) is scored for toxicity. Transcribe plus a single translation runs as one chain-of-thought inference per segment rather than two passes.
+Audio is loaded and resampled to 16 kHz mono, optionally segmented with VAD, then transcribed and translated segment-by-segment on the GPU. Each segment is encoded once and reused across every selected task, so N tasks cost one audio encode rather than N. Any output that may be English is scored for toxicity.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ uv sync
 uv run streamlit run streamlit_app.py
 ```
 
-> First run downloads the Granite Speech model (~2.9 GB) plus the VAD and guardian models, then caches them; inference runs on the Apple Silicon GPU.
+> First run downloads the Granite Speech model (~3.3 GB) plus the VAD and guardian models, then caches them; inference runs on the Apple Silicon GPU.
 
 ## Usage
 
@@ -74,7 +74,8 @@ uv run streamlit run streamlit_app.py
 - **Apple Silicon only** — inference uses MLX; there's no CUDA or CPU-only fallback.
 - **Translation pivots through English** — English ↔ X only; no direct X → Y (e.g. French → German).
 - **Toxicity detection is English-only** (Granite Guardian HAP).
-- **Upload limit 500 MB**; with VAD off, clips are capped at 5 minutes (the model's context window).
+- **Upload limit 500 MB**; with VAD off, clips are capped at 2 minutes — a single inference that long already peaks around 14 GB of memory.
+- **Translation needs VAD on.** Past roughly 20 seconds in one pass the model stops translating and echoes the source language back verbatim, with no error. VAD segmentation keeps every chunk under 8s, which is why it defaults to on.
 
 ## Development
 
@@ -87,7 +88,8 @@ uv run pytest           # run tests
 
 ## Resources
 
-- [Granite 4.0 1B Speech (8-bit, MLX)](https://huggingface.co/mlx-community/granite-4.0-1b-speech-8bit) — model card
+- [Granite Speech 4.1 2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) — IBM's model card
+- [Granite Speech 4.1 2B (8-bit, MLX)](https://huggingface.co/divydeep/granite-speech-4.1-2b-mlx-8bit) — the community MLX conversion this app loads
 - [Granite Speech collection](https://huggingface.co/collections/ibm-granite/granite-speech)
 - [Technical report](https://arxiv.org/abs/2505.08699)
 

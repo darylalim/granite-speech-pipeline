@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import io
-import re
+import math
 import warnings
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, NotRequired, TypedDict
 from pathlib import Path
 
+import mlx.core as mx
 import streamlit as st
 import torch
 import torchaudio
@@ -32,7 +33,10 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 warnings.filterwarnings(
     "ignore", message="An output with one or more elements was resized"
 )
-MODEL_ID = "mlx-community/granite-4.0-1b-speech-8bit"
+MODEL_ID = "divydeep/granite-speech-4.1-2b-mlx-8bit"
+# Pinned: MODEL_ID is a personal-account conversion, not an org-maintained
+# repo, so an unpinned main could change weights under us on any cold cache.
+MODEL_REVISION = "8b45a92464686505ee42658cdbbd1946c2762b5b"
 GUARDIAN_MODEL_ID = "ibm-granite/granite-guardian-hap-125m"
 SOURCE_LANGUAGES = [
     "English",
@@ -66,7 +70,27 @@ SUPPORTED_FORMATS = [
 ]
 VIDEO_FORMATS = {"mp4", "mov", "webm", "mkv"}
 SAMPLE_RATE = 16000
-MAX_VAD_OFF_DURATION_S = 300
+# Ceiling for the VAD-off path, where the whole clip is one inference. Set by
+# measured peak MLX memory (fresh process per run, 8-bit 2B weights = 3.3 GB
+# resident): 30s -> 8.4 GB, 60s -> 9.5 GB, 120s -> 14.5 GB, 300s -> 17.1 GB.
+# The old 300s was calibrated against the 1B model; on this one it puts a 16 GB
+# Mac into swap. 120s caps the worst case around 14.5 GB. Correctness is not the
+# binding constraint here — ~350s is where the 4096-position context runs out —
+# memory is. Drop to 60s if 16 GB machines still struggle.
+MAX_VAD_OFF_DURATION_S = 120
+# Longest segment fed to a single inference when VAD is on. Two bounds apply,
+# and the tighter one wins by a wide margin:
+#   context — the model emits ~10.2 audio tokens/s against 4096 positions, so
+#             with max_tokens=512 reserved the hard ceiling is ~350s;
+#   quality — translation degrades far sooner. Measured on 40s of continuous
+#             speech, counting segments whose German output is actually German:
+#             10s -> 2/4, 8s -> 6/6, 6s -> 8/8, 5s -> 12/12, 4s -> 12/16.
+#             Above ~20s every target language collapses to source-language
+#             passthrough; below ~5s the splits land mid-utterance and cost
+#             accuracy again.
+# 8s is the widest cap that still translated everything, so it fragments the
+# audio (and multiplies inference count) as little as possible.
+MAX_SEGMENT_DURATION_S = 8.0
 TOXICITY_THRESHOLD = 0.5
 TOXICITY_SCORE_PRECISION = 4
 
@@ -96,9 +120,21 @@ def apply_keywords(prompt: str, keywords: list[str]) -> str:
 
 
 def produces_english(source: str, task: str) -> bool:
+    """Can this (source, task) pair put English text on a result card?
+
+    Transcription is English exactly when the audio is, and a translation into
+    English always is. Beyond that: when the audio is English, *any* target can
+    come back as untranslated English passthrough (see the segment-length note
+    in CLAUDE.md), so those count too — the guardian scoring a genuinely French
+    card is a far cheaper mistake than skipping it on English text that turned
+    out to be toxic.
+
+    Non-English sources need no such widening: passthrough there emits the
+    source language, which is not English by definition.
+    """
     if task == "Transcribe":
         return source == "English"
-    return task == "English"
+    return task == "English" or source == "English"
 
 
 def compute_safety_tasks(
@@ -129,29 +165,6 @@ def format_timestamp(seconds: float) -> str:
     return f"{mins}:{secs:02d}"
 
 
-def _detect_cot_target(tasks: dict[str, str]) -> str | None:
-    if "Transcribe" not in tasks:
-        return None
-    other_tasks = [t for t in tasks if t != "Transcribe"]
-    if len(other_tasks) != 1:
-        return None
-    return other_tasks[0]
-
-
-def _cot_prompt(target: str) -> str:
-    return f"Can you transcribe the speech, and then translate it to {target}?"
-
-
-def _parse_cot_output(text: str) -> tuple[str, str]:
-    transcription_match = re.search(
-        r"\[Transcription\](.*?)(?=\[Translation\]|$)", text, re.DOTALL
-    )
-    translation_match = re.search(r"\[Translation\](.*)$", text, re.DOTALL)
-    transcription = transcription_match.group(1).strip() if transcription_match else ""
-    translation = translation_match.group(1).strip() if translation_match else ""
-    return transcription, translation
-
-
 def silero_vad(
     wav: torch.Tensor, model: torch.nn.Module, sample_rate: int = SAMPLE_RATE
 ) -> list[tuple[float, float]]:
@@ -163,15 +176,35 @@ def silero_vad(
     ]
 
 
+def _split_long_segment(
+    start: float, end: float, max_duration: float
+) -> list[dict[str, float]]:
+    """Split an over-long span into equal parts, each at most max_duration.
+
+    Equal parts rather than max_duration-sized chunks plus a remainder: a
+    30.1s span becomes 3 x ~10s, not 2 x 15s + one 0.1s sliver that would
+    transcribe to nothing.
+    """
+    duration = end - start
+    if duration <= max_duration:
+        return [{"start": start, "end": end}]
+    parts = math.ceil(duration / max_duration)
+    step = duration / parts
+    return [
+        {"start": start + i * step, "end": start + (i + 1) * step} for i in range(parts)
+    ]
+
+
 def get_speech_segments(
     wav: torch.Tensor,
     model: torch.nn.Module,
     sample_rate: int = SAMPLE_RATE,
+    max_segment_duration: float = MAX_SEGMENT_DURATION_S,
 ) -> list[dict[str, float]]:
     duration = wav.shape[-1] / sample_rate
     vad_segments = silero_vad(wav, model, sample_rate)
     if not vad_segments:
-        return [{"start": 0.0, "end": duration}]
+        return _split_long_segment(0.0, duration, max_segment_duration)
     start_buffer = 0.3
     end_buffer = 0.3
     min_gap = 0.5
@@ -179,16 +212,29 @@ def get_speech_segments(
     for start, end in vad_segments:
         buffered_start = max(0.0, start - start_buffer)
         buffered_end = min(duration, end + end_buffer)
-        if segments and buffered_start - segments[-1]["end"] < min_gap:
+        # Merge across short gaps, but never past the cap — continuous speech
+        # would otherwise collapse into one unbounded segment.
+        if (
+            segments
+            and buffered_start - segments[-1]["end"] < min_gap
+            and max(segments[-1]["end"], buffered_end) - segments[-1]["start"]
+            <= max_segment_duration
+        ):
             segments[-1]["end"] = max(segments[-1]["end"], buffered_end)
         else:
             segments.append({"start": buffered_start, "end": buffered_end})
-    return segments
+    # A single VAD span can exceed the cap on its own (unbroken speech, or the
+    # no-gap fallback above), so split whatever is still over.
+    return [
+        part
+        for seg in segments
+        for part in _split_long_segment(seg["start"], seg["end"], max_segment_duration)
+    ]
 
 
 @st.cache_resource(show_spinner=False)
-def load_model(model_id: str) -> Any:
-    return _load_stt_model(model_id)
+def load_model(model_id: str, revision: str | None = None) -> Any:
+    return _load_stt_model(model_id, revision=revision)
 
 
 def load_and_preprocess_audio(audio_file: UploadedFile) -> torch.Tensor:
@@ -273,6 +319,70 @@ def transcribe_audio(
     return output.text
 
 
+# model.generate() re-runs mel extraction and the 16-layer conformer encoder on
+# every call, but that work depends only on the audio — not the prompt. Running
+# N tasks over one segment therefore pays for N encodes where 1 would do, and
+# the encoder is ~33% of a call. These two helpers split generate() so the
+# encode can be hoisted out of the task loop.
+#
+# They reach into mlx_audio internals, so `_supports_encoder_hoist` gates them
+# and run_pipeline falls back to the public `transcribe_audio` path when a
+# future version renames something. The fallback is correct, just slower.
+_HOIST_ATTRS = (
+    "_extract_features",
+    "get_audio_features",
+    "_build_prompt",
+    "_build_inputs_embeds",
+    "_tokenizer",
+)
+
+
+def _supports_encoder_hoist(model: Any) -> bool:
+    return all(hasattr(model, attr) for attr in _HOIST_ATTRS)
+
+
+def _encode_segment(wav: torch.Tensor, model: Any) -> tuple[Any, int]:
+    input_features, num_audio_tokens = model._extract_features(wav.squeeze().numpy())
+    audio_features = model.get_audio_features(input_features)
+    mx.eval(audio_features)
+    return audio_features, num_audio_tokens
+
+
+def _generate_from_features(
+    audio_features: Any,
+    num_audio_tokens: int,
+    prompt: str,
+    model: Any,
+    max_tokens: int = 512,
+) -> str:
+    """Decode one prompt against pre-encoded audio.
+
+    Sampler settings mirror mlx_audio's own generate() defaults (greedy), so
+    output is identical to the non-hoisted path.
+    """
+    from mlx_lm.generate import generate_step
+    from mlx_lm.sample_utils import make_sampler
+
+    prompt_ids = model._build_prompt(num_audio_tokens, prompt)
+    inputs_embeds = model._build_inputs_embeds(prompt_ids, audio_features)
+    mx.eval(inputs_embeds)
+
+    eos_token_id = model._tokenizer.eos_token_id
+    tokens: list[Any] = []
+    for token, _ in generate_step(
+        prompt=prompt_ids,
+        input_embeddings=inputs_embeds.squeeze(0),
+        model=model,
+        max_tokens=max_tokens,
+        sampler=make_sampler(0.0, top_p=1.0, min_p=0.0, top_k=0),
+        prefill_step_size=2048,
+    ):
+        if token == eos_token_id:
+            break
+        tokens.append(token)
+    return model._tokenizer.decode(tokens, skip_special_tokens=True)
+
+
 def _aggregate_segment_safety(
     texts: list[str], model: Any, tokenizer: Any
 ) -> tuple[bool, float]:
@@ -310,59 +420,45 @@ def run_pipeline(
         segments = [{"start": 0.0, "end": duration}]
     if keywords is None:
         keywords = []
-    # CoT relies on Transcribe being iterated before the translation target;
-    # build_tasks preserves this via insertion order.
-    cot_target = _detect_cot_target(tasks)
-    cot_translation_cache: dict[int, str] = {}
-    results: dict[str, PipelineResult] = {}
-    for i, (task, prompt) in enumerate(tasks.items()):
-        if on_progress:
-            on_progress(i, len(tasks), task)
-        use_cot = cot_target is not None and task == "Transcribe"
-        read_cot_cache = cot_target is not None and task == cot_target
-        if use_cot:
-            assert cot_target is not None
-            base_prompt = _cot_prompt(cot_target)
-        else:
-            base_prompt = prompt
-        actual_prompt = apply_keywords(base_prompt, keywords)
-        raw_texts: list[str] = []
-        lines: list[str] = []
-        for seg_idx, seg in enumerate(segments):
-            start_sample = int(seg["start"] * SAMPLE_RATE)
-            end_sample = int(seg["end"] * SAMPLE_RATE)
-            if read_cot_cache and seg_idx in cot_translation_cache:
-                text = cot_translation_cache[seg_idx]
+
+    # Keywords bias transcription only — that is what the UI promises, and
+    # appending them to a translation prompt measurably degrades it (the model
+    # drops back to untranslated, truncated source text).
+    prompts = {
+        task: apply_keywords(prompt, keywords) if task == "Transcribe" else prompt
+        for task, prompt in tasks.items()
+    }
+
+    # Segments outer, tasks inner: the audio encoding depends only on the
+    # segment, so this encodes each segment once and reuses it across every
+    # task instead of re-encoding per (task, segment) pair.
+    hoist = _supports_encoder_hoist(model)
+    raw_texts: dict[str, list[str]] = {task: [] for task in tasks}
+    lines: dict[str, list[str]] = {task: [] for task in tasks}
+    total_steps = max(len(segments) * len(tasks), 1)
+    step = 0
+
+    for seg in segments:
+        start_sample = int(seg["start"] * SAMPLE_RATE)
+        end_sample = int(seg["end"] * SAMPLE_RATE)
+        chunk = wav[:, start_sample:end_sample]
+        encoded = _encode_segment(chunk, model) if hoist else None
+        ts_start = format_timestamp(seg["start"])
+        ts_end = format_timestamp(seg["end"])
+        for task, actual_prompt in prompts.items():
+            if on_progress:
+                on_progress(step, total_steps, task)
+            step += 1
+            if encoded is not None:
+                text = _generate_from_features(*encoded, actual_prompt, model)
             else:
-                raw = transcribe_audio(
-                    wav[:, start_sample:end_sample], actual_prompt, model
-                )
-                if use_cot:
-                    transcription, translation = _parse_cot_output(raw)
-                    if not transcription:
-                        # CoT didn't yield a usable transcription (no tags, or
-                        # only [Translation] was emitted). Re-run with the
-                        # direct ASR prompt so untagged/translation output
-                        # isn't mistakenly displayed as the transcription.
-                        text = transcribe_audio(
-                            wav[:, start_sample:end_sample],
-                            apply_keywords(prompt, keywords),
-                            model,
-                        )
-                    else:
-                        text = transcription
-                    # Only cache when the model actually produced a
-                    # translation; an empty value would later be served from
-                    # the cache instead of triggering a direct AST call.
-                    if translation:
-                        cot_translation_cache[seg_idx] = translation
-                else:
-                    text = raw
-            raw_texts.append(text)
-            ts_start = format_timestamp(seg["start"])
-            ts_end = format_timestamp(seg["end"])
-            lines.append(f"[{ts_start} - {ts_end}] {text}")
-        result: PipelineResult = {"transcript": "\n".join(lines)}
+                text = transcribe_audio(chunk, actual_prompt, model)
+            raw_texts[task].append(text)
+            lines[task].append(f"[{ts_start} - {ts_end}] {text}")
+
+    results: dict[str, PipelineResult] = {}
+    for task in tasks:
+        result: PipelineResult = {"transcript": "\n".join(lines[task])}
         if (
             task in safety_tasks
             and guardian_model is not None
@@ -371,7 +467,7 @@ def run_pipeline(
             # Per-segment so long transcripts don't get silently truncated by
             # the guardian's 512-token cap; report the worst segment's score.
             is_toxic, score = _aggregate_segment_safety(
-                raw_texts, guardian_model, guardian_tokenizer
+                raw_texts[task], guardian_model, guardian_tokenizer
             )
             result["is_toxic"] = is_toxic
             result["toxicity_score"] = score
@@ -444,8 +540,8 @@ def main() -> None:
     st.title("Granite Speech Studio", text_alignment="center")
     st.markdown(
         "Transcribe and translate audio and video files with the "
-        "[IBM Granite 4.0 1B Speech model]"
-        "(https://huggingface.co/ibm-granite/granite-4.0-1b-speech).",
+        "[IBM Granite Speech 4.1 2B model]"
+        "(https://huggingface.co/ibm-granite/granite-speech-4.1-2b).",
         text_alignment="center",
     )
 
@@ -513,8 +609,9 @@ def main() -> None:
             vad_off_too_long = True
             st.warning(
                 f"Enable VAD segmentation: audio is longer than "
-                f"{MAX_VAD_OFF_DURATION_S // 60} minutes, which exceeds the "
-                "model's per-call audio limit.",
+                f"{MAX_VAD_OFF_DURATION_S // 60} minutes. A single inference "
+                "that long needs well over 14 GB of memory, and translation "
+                "falls back to untranslated source text on long audio.",
                 icon=":material/warning:",
             )
 
@@ -579,7 +676,7 @@ def main() -> None:
         progress = st.progress(0, text="Starting pipeline...")
         try:
             with st.spinner("Loading speech model..."):
-                model = load_model(MODEL_ID)
+                model = load_model(MODEL_ID, MODEL_REVISION)
             wav = load_and_preprocess_audio(audio_file)
 
             if use_segmentation:
