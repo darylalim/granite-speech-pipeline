@@ -17,10 +17,13 @@ import math
 import warnings
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, NotRequired, TypedDict
 from pathlib import Path
+from typing import Any, NotRequired, TypedDict
 
-import mlx.core as mx
+# mlx 0.32.0 dropped mlx/core/*.pyi while still shipping py.typed, so ty resolves
+# the package but not the compiled `core` extension. Drop the suppression once
+# upstream ships stubs again.
+import mlx.core as mx  # ty: ignore[unresolved-import]
 import streamlit as st
 import torch
 import torchaudio
@@ -301,8 +304,7 @@ def check_safety(
         inputs = tokenizer([chunk], padding=True, truncation=True, return_tensors="pt")
         logits = model(**inputs).logits
         probability = torch.softmax(logits, dim=1)[0, 1].item()
-        if probability > max_probability:
-            max_probability = probability
+        max_probability = max(max_probability, probability)
     return (
         max_probability > TOXICITY_THRESHOLD,
         round(max_probability, TOXICITY_SCORE_PRECISION),
@@ -391,8 +393,7 @@ def _aggregate_segment_safety(
         if not text.strip():
             continue
         _, probability = check_safety(text, model, tokenizer)
-        if probability > max_probability:
-            max_probability = probability
+        max_probability = max(max_probability, probability)
     return (
         max_probability > TOXICITY_THRESHOLD,
         round(max_probability, TOXICITY_SCORE_PRECISION),
@@ -718,13 +719,16 @@ def main() -> None:
             if uploaded:
                 stem = Path(audio_file.name).stem
             else:
-                stem = datetime.now().strftime("recording_%Y%m%d_%H%M%S")
+                # Local wall-clock is what a user expects in a filename.
+                stem = datetime.now().strftime(  # noqa: DTZ005
+                    "recording_%Y%m%d_%H%M%S"
+                )
             st.session_state.result_stem = stem
             st.session_state.result_source = source
         except RuntimeError as e:
             st.error(str(e))
             return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - top-level UI error boundary
             st.exception(e)
             return
         st.toast("Pipeline complete!")

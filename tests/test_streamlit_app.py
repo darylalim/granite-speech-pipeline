@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from itertools import pairwise
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
@@ -10,8 +11,8 @@ import torch
 from streamlit_app import (
     EN_TARGETS,
     GUARDIAN_MODEL_ID,
-    MAX_VAD_OFF_DURATION_S,
     MAX_SEGMENT_DURATION_S,
+    MAX_VAD_OFF_DURATION_S,
     MODEL_ID,
     MODEL_REVISION,
     SOURCE_LANGUAGES,
@@ -21,8 +22,8 @@ from streamlit_app import (
     PipelineResult,
     _aggregate_segment_safety,
     _render_result_card,
-    _supports_encoder_hoist,
     _row_sizes,
+    _supports_encoder_hoist,
     apply_keywords,
     audio_duration_seconds,
     build_tasks,
@@ -446,7 +447,7 @@ class TestGetSpeechSegments:
         )
         assert result[0]["start"] == pytest.approx(0.0)
         assert result[-1]["end"] == pytest.approx(31.6)
-        for earlier, later in zip(result, result[1:]):
+        for earlier, later in pairwise(result):
             assert earlier["end"] == pytest.approx(later["start"])
 
     def test_no_speech_fallback_is_also_capped(self) -> None:
