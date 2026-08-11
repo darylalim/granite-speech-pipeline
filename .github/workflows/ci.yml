@@ -34,7 +34,8 @@ jobs:
           enable-cache: true
 
       # --locked fails if uv.lock is out of sync with pyproject.toml, mirroring
-      # the block-lockfile-edit.sh guard: the lock changes only via uv.
+      # the Edit(uv.lock) deny rule in .claude/settings.json: the lock changes
+      # only via uv.
       - name: Install dependencies
         run: uv sync --locked
 

@@ -1,16 +1,8 @@
 {
+  "permissions": {
+    "deny": ["Edit(uv.lock)"]
+  },
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-lockfile-edit.sh\""
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",

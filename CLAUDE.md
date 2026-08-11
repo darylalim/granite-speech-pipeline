@@ -24,9 +24,10 @@ Requires FFmpeg's shared libs at runtime (`brew install ffmpeg` on macOS) — `s
 
 When working with Python, invoke the relevant `/astral:<skill>` (`/astral:uv`, `/astral:ty`, `/astral:ruff`) for uv, ty, and ruff to ensure best practices are followed.
 
-## Hooks & CI
+## Permissions, Hooks & CI
 
-- `.claude/` hooks: a **Stop hook** (`check-on-stop.sh`) auto-runs `ruff check` + `ty check` + `pytest -q` and blocks turn completion on failure when `.py` files changed — no need to hand-run them at end of turn. A **PreToolUse hook** blocks edits to `uv.lock` (use `uv add`/`remove`/`lock`/`sync`). A **PostToolUse hook** (`ruff-on-edit.sh`) auto-`ruff format`s edited `.py` files (format only, not `check --fix`).
+- `.claude/settings.json` **permissions**: `"deny": ["Edit(uv.lock)"]` — the lock is generated and must change only via uv (`uv add`/`remove`/`lock`/`sync`); a hand-edit desyncs it from `pyproject.toml` and breaks resolution. This replaced a PreToolUse hook that did the same check in bash: the rule needs no subprocess per edit, has no `jq` dependency to fail open on, and also covers file commands Claude Code recognises in Bash (`sed -i`, `cat >`) that the hook's `Edit|Write` matcher missed. It must be spelled `Edit(...)`, not `Write(...)` — path rules are consulted for `Edit(path)`/`Read(path)` only, and an `Edit` rule already covers Write and NotebookEdit; a `Write(uv.lock)` rule would be accepted, never consulted, and warn at startup. Running `uv` itself is unaffected: deny rules don't reach subprocesses that write files themselves.
+- `.claude/` hooks: a **Stop hook** (`check-on-stop.sh`) auto-runs `ruff check` + `ty check` + `pytest -q` and blocks turn completion on failure when `.py` files changed — no need to hand-run them at end of turn (~5.5s: ruff 0.03s, ty 0.95s, pytest 4.6s). A **PostToolUse hook** (`ruff-on-edit.sh`) auto-`ruff format`s edited `.py` files (format only, not `check --fix`). The two don't overlap by design — format is idempotent and safe after every edit, lint is order-dependent and gated once when the code is stable.
 - CI (`.github/workflows/ci.yml`): GitHub Actions on macOS, Python **3.12 and 3.13**, enforcing `uv sync --locked`, `ruff check`, `ruff format --check`, `ty check`, and `pytest`.
 
 ## Code Style
