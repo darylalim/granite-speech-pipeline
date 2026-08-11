@@ -8,17 +8,14 @@ on:
 permissions:
   contents: read
 
-# Cancel an in-progress run when a newer commit lands on the same ref.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   check:
-    name: check (py${{ matrix.python-version }})
-    # macOS Apple Silicon: streamlit_app imports mlx_audio at module load, and
-    # uv.lock pins mlx-metal to sys_platform == 'darwin', so the deps only
-    # install here. Free on public repos.
+    # macOS only: streamlit_app imports mlx_audio at module load, and uv.lock
+    # pins mlx-metal to sys_platform == 'darwin'. Free on public repos.
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -27,33 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
-      # --locked fails if uv.lock is out of sync with pyproject.toml, mirroring
-      # the Edit(uv.lock) deny rule in .claude/settings.json: the lock changes
-      # only via uv.
-      - name: Install dependencies
-        run: uv sync --locked
+      - run: uv sync --locked
 
-      - name: Lint (ruff)
-        run: uv run ruff check .
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check
 
-      - name: Format check (ruff)
-        run: uv run ruff format --check .
+      # torchcodec dlopen()s FFmpeg's shared libs at import and macos-latest no
+      # longer ships them. After ty so the fast checks fail before the install.
+      - run: brew install ffmpeg
 
-      - name: Type check (ty)
-        run: uv run ty check
-
-      # torchcodec dlopen()s FFmpeg's shared libs (libavutil, ...) at import,
-      # and the macos-latest image no longer ships them. brew installs them to
-      # /opt/homebrew/opt/ffmpeg/lib — exactly where torchcodec's @rpath looks.
-      # Placed after ty so the fast checks fail before paying for the install.
-      - name: Install FFmpeg (torchcodec runtime dep)
-        run: brew install ffmpeg
-
-      - name: Test (pytest)
-        run: uv run pytest -q
+      - run: uv run pytest -q
