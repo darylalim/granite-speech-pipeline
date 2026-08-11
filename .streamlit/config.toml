@@ -1,32 +1,9 @@
 [server]
 maxUploadSize = 500
 
-# IBM Carbon-inspired theme to match the Granite branding.
-# Colors only (no custom web fonts) so the app stays dependency-free offline.
-# Mode-agnostic settings live in [theme]; [theme.light] and [theme.dark] supply
-# the per-mode palettes and together enable the settings-menu light/dark toggle.
-[theme]
-linkUnderline = false
-showWidgetBorder = true
-baseRadius = "0.5rem"
-buttonRadius = "0.5rem"
-
-[theme.light]
-primaryColor = "#0f62fe"            # IBM Carbon Blue 60
-linkColor = "#0f62fe"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f4f4f4"
-textColor = "#161616"               # IBM Carbon Gray 100
-borderColor = "#e0e0e0"
-greenColor = "#24a148"              # safe banner (Carbon Green 50)
-redColor = "#da1e28"                # error / pipeline-failure callout (Carbon Red 60)
-
-[theme.dark]
-primaryColor = "#4589ff"            # IBM Carbon Blue 50 (brighter for dark)
-linkColor = "#4589ff"
-backgroundColor = "#161616"         # IBM Carbon Gray 100
-secondaryBackgroundColor = "#262626"  # IBM Carbon Gray 90
-textColor = "#f4f4f4"               # IBM Carbon Gray 10
-borderColor = "#393939"             # IBM Carbon Gray 80
-greenColor = "#42be65"              # safe banner (Carbon Green 40)
-redColor = "#fa4d56"                # error / pipeline-failure callout (Carbon Red 50)
+# No [theme] section on purpose: the app uses Streamlit's built-in light and
+# dark themes, so the settings menu offers Light / Dark / System. Every theme
+# option defaults to None (unset), which is what tells the frontend to apply its
+# own palette — writing the default values back in would not be equivalent.
+# Note a *custom* theme locks the app to one mode unless it defines both
+# [theme.light] and [theme.dark]; that constraint does not apply here.

@@ -29,9 +29,9 @@ def audio_bytes() -> bytes:
 
 
 @pytest.fixture
-def theme_config() -> dict:
-    """The parsed `[theme]` table from .streamlit/config.toml."""
-    return tomllib.loads(CONFIG.read_text())["theme"]
+def app_config() -> dict:
+    """The parsed .streamlit/config.toml."""
+    return tomllib.loads(CONFIG.read_text())
 
 
 def _app() -> AppTest:
@@ -198,36 +198,32 @@ def test_run_renders_multiple_result_cards(audio_bytes: bytes) -> None:
     assert "bonjour le monde" in texts
 
 
-def test_theme_config_defines_light_and_dark(theme_config: dict) -> None:
-    """config.toml defines both [theme.light] and [theme.dark] color palettes,
-    which together enable the settings-menu light/dark toggle."""
-    theme = theme_config
-    assert "light" in theme and "dark" in theme
-    for mode in ("light", "dark"):
-        for key in (
-            "primaryColor",
-            "backgroundColor",
-            "textColor",
-            "greenColor",
-            "redColor",
-        ):
-            assert key in theme[mode], f"theme.{mode}.{key} missing"
+def test_config_defines_no_custom_theme(app_config: dict) -> None:
+    """config.toml carries no [theme] table, so the app renders in Streamlit's
+    built-in light and dark themes and the settings menu offers Light / Dark /
+    System. Every theme option defaults to None, and unset is what makes the
+    frontend apply its own palette — so a [theme] table spelling out the
+    default values would not be equivalent. A partial custom theme is worse
+    still: without both [theme.light] and [theme.dark] it locks the app to a
+    single mode and the toggle disappears."""
+    assert "theme" not in app_config
 
 
-def test_theme_config_has_no_invalid_options(theme_config: dict) -> None:
-    """Every key under [theme] is a registered Streamlit config option. Guards
-    against silently-dropped keys like the invalid `theme.light.base` (only
-    `theme.base` exists; sub-themes have no `base`)."""
+def test_config_has_no_invalid_options(app_config: dict) -> None:
+    """Every key in config.toml is a registered Streamlit config option.
+    Unknown keys are dropped silently rather than rejected, so a typo (or an
+    option that only ever existed in a sibling table, as `base` does for
+    [theme] but not [theme.light]) would otherwise go unnoticed."""
     valid = set(config._config_options_template)
-    assert "theme.primaryColor" in valid  # registry is populated
+    assert "server.maxUploadSize" in valid  # registry is populated
 
     def walk(prefix: str, table: dict) -> Iterator[str]:
         for key, value in table.items():
-            full = f"{prefix}.{key}"
+            full = f"{prefix}.{key}" if prefix else key
             if isinstance(value, dict):
                 yield from walk(full, value)
             else:
                 yield full
 
-    invalid = [k for k in walk("theme", theme_config) if k not in valid]
-    assert invalid == [], f"invalid theme config options: {invalid}"
+    invalid = [k for k in walk("", app_config) if k not in valid]
+    assert invalid == [], f"invalid config options: {invalid}"
