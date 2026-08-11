@@ -1,9 +1,14 @@
-[server]
-maxUploadSize = 500
-
 # No [theme] section on purpose: the app uses Streamlit's built-in light and
-# dark themes, so the settings menu offers Light / Dark / System. Every theme
+# dark themes, so the settings menu offers System / Light / Dark. Every theme
 # option defaults to None (unset), which is what tells the frontend to apply its
 # own palette — writing the default values back in would not be equivalent.
-# Note a *custom* theme locks the app to one mode unless it defines both
-# [theme.light] and [theme.dark]; that constraint does not apply here.
+# A partial custom theme is worse than none: verified on 1.61.1, a [theme] table
+# carrying only primaryColor drops the appearance section from the menu outright
+# and locks the app to one mode. Both [theme.light] and [theme.dark] or neither.
+#
+# This block sits above [server] deliberately. TOML scoping is positional, so a
+# key added under a comment that trails a table header joins that table — put
+# theme options beneath a [theme] header of their own, not here.
+
+[server]
+maxUploadSize = 500

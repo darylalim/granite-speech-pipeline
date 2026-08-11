@@ -30,8 +30,10 @@ def audio_bytes() -> bytes:
 
 @pytest.fixture
 def app_config() -> dict:
-    """The parsed .streamlit/config.toml."""
-    return tomllib.loads(CONFIG.read_text())
+    """The parsed .streamlit/config.toml. Read as UTF-8 explicitly, which TOML
+    mandates and Streamlit itself passes — `read_text()` would otherwise decode
+    the file's comments with whatever the platform locale happens to be."""
+    return tomllib.loads(CONFIG.read_text(encoding="utf-8"))
 
 
 def _app() -> AppTest:
@@ -199,14 +201,68 @@ def test_run_renders_multiple_result_cards(audio_bytes: bytes) -> None:
 
 
 def test_config_defines_no_custom_theme(app_config: dict) -> None:
-    """config.toml carries no [theme] table, so the app renders in Streamlit's
-    built-in light and dark themes and the settings menu offers Light / Dark /
-    System. Every theme option defaults to None, and unset is what makes the
-    frontend apply its own palette — so a [theme] table spelling out the
-    default values would not be equivalent. A partial custom theme is worse
-    still: without both [theme.light] and [theme.dark] it locks the app to a
-    single mode and the toggle disappears."""
-    assert "theme" not in app_config
+    """No [theme] table, so the app gets Streamlit's built-in themes and the
+    settings menu offers System / Light / Dark. See CLAUDE.md for why writing
+    the defaults back in is not the same thing.
+
+    The second half is the guard that outlives this config: should a custom
+    theme ever be reintroduced, it has to define both sub-palettes or the
+    appearance menu disappears entirely and the app locks to one mode
+    (verified against 1.61.1 — a [theme] table carrying only primaryColor
+    renders the menu with no appearance section at all)."""
+    if "theme" in app_config:
+        assert {"light", "dark"} <= app_config["theme"].keys()
+
+
+def _option_paths(table: dict, valid: set[str]) -> Iterator[str]:
+    """Flatten a parsed config.toml into the option paths it sets."""
+
+    def walk(path: str, value: object) -> Iterator[str]:
+        if path in valid:
+            # A registered option, so stop rather than descend: a few options
+            # take a table as their value (server.trustedUserHeaders) or a list
+            # of them ([[theme.fontFaces]]), and those inner keys are free-form
+            # rather than registry names.
+            yield path
+        elif isinstance(value, dict) and value:
+            # An unregistered table with contents is a section, not a key.
+            for key, child in value.items():
+                yield from walk(f"{path}.{key}", child)
+        else:
+            # Scalar, list, or empty table under an unregistered path. The empty
+            # case is what reports a typo'd section header with no keys of its
+            # own, which would otherwise flatten to nothing and pass.
+            yield path
+
+    for key, value in table.items():
+        yield from walk(key, value)
+
+
+@pytest.mark.parametrize(
+    ("table", "expected"),
+    [
+        ({"server": {"maxUploadSize": 500}}, ["server.maxUploadSize"]),
+        # An option whose value is a table is a leaf; its keys are free-form.
+        (
+            {"server": {"trustedUserHeaders": {"X-Forwarded-User": "email"}}},
+            ["server.trustedUserHeaders"],
+        ),
+        # As is one whose value is an array of tables.
+        ({"theme": {"fontFaces": [{"family": "X", "url": "u"}]}}, ["theme.fontFaces"]),
+        # Typos still surface at every depth and every shape.
+        ({"theme": {"typoColor": "#fff"}}, ["theme.typoColor"]),
+        ({"thheme": {"fontFaces": [{"family": "X"}]}}, ["thheme.fontFaces"]),
+        ({"browserr": {}}, ["browserr"]),
+    ],
+)
+def test_option_paths_stops_at_registered_options(
+    table: dict, expected: list[str]
+) -> None:
+    """The shipped config exercises one path of _option_paths, so the rest are
+    pinned here: descending into an option's own value fails a valid config,
+    and not reaching a typo under an unregistered prefix passes an invalid one.
+    """
+    assert list(_option_paths(table, set(config._config_options_template))) == expected
 
 
 def test_config_has_no_invalid_options(app_config: dict) -> None:
@@ -215,15 +271,6 @@ def test_config_has_no_invalid_options(app_config: dict) -> None:
     option that only ever existed in a sibling table, as `base` does for
     [theme] but not [theme.light]) would otherwise go unnoticed."""
     valid = set(config._config_options_template)
-    assert "server.maxUploadSize" in valid  # registry is populated
-
-    def walk(prefix: str, table: dict) -> Iterator[str]:
-        for key, value in table.items():
-            full = f"{prefix}.{key}" if prefix else key
-            if isinstance(value, dict):
-                yield from walk(full, value)
-            else:
-                yield full
-
-    invalid = [k for k in walk("", app_config) if k not in valid]
+    assert "theme.primaryColor" in valid  # registry is populated
+    invalid = [path for path in _option_paths(app_config, valid) if path not in valid]
     assert invalid == [], f"invalid config options: {invalid}"

@@ -7,7 +7,7 @@
 Streamlit application for transcription and translation using IBM Granite Speech on Apple Silicon with MLX.
 
 <p align="center">
-  <img src="docs/screenshot-dark.png" alt="Granite Speech Studio transcribing an English clip and translating it to French" width="70%">
+  <img src="docs/screenshot-dark.png" alt="Granite Speech Studio in dark mode, transcribing an English clip and translating it to French" width="70%">
 </p>
 <p align="center"><em>Transcription + French translation of a sample clip, in dark mode.</em></p>
 
