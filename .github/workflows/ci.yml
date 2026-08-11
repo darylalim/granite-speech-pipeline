@@ -8,9 +8,10 @@ on:
 permissions:
   contents: read
 
+# PR runs are disposable; main runs can publish a release, so let them finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -40,3 +41,54 @@ jobs:
       - run: brew install ffmpeg
 
       - run: uv run pytest -q
+
+  # Tags and publishes v<version> when pyproject.toml names a version that has
+  # no release yet. Reading the version beats diffing it: re-runs, multi-commit
+  # pushes and manual tags all converge on "does v$version exist?", so the job
+  # is idempotent and a failed run is fixed by re-running it.
+  release:
+    needs: check
+    if: github.event_name == 'push'
+    # Nothing here imports the app, so this leg skips macOS and its deps.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # git describe/log need tags and history
+
+      - name: Publish release on version bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          tag="v$version"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released; nothing to do."
+            exit 0
+          fi
+
+          # --exclude "$tag" so a tag pushed by hand before the bump lands does
+          # not become its own baseline and empty the changelog.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$tag" 2>/dev/null || true)
+          if [ -n "$prev" ]; then range="$prev..HEAD"; else range="HEAD"; fi
+
+          # Notes come from commit subjects, not gh --generate-notes: that
+          # builds from merged PRs and this repo has none, so it would emit a
+          # bare changelog link.
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --format='* %s (%h)' "$range"
+            if [ -n "$prev" ]; then
+              echo
+              echo "**Full changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$tag"
+            fi
+          } >"$RUNNER_TEMP/notes.md"
+
+          # --target pins the tag to the commit check ran on, not whatever main
+          # points at by now. Title defaults to the tag, matching v0.11.0.
+          gh release create "$tag" --target "$GITHUB_SHA" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "Published $tag."
